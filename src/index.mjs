@@ -50,13 +50,16 @@ export function normalizeKeyedMap(val, { keyField = 'id', aliases = {} } = {}) {
 export function fuzzyResolveId(ownedIds, inputId) {
   if (!Array.isArray(ownedIds) || ownedIds.length === 0) return null;
   if (ownedIds.includes(inputId)) return inputId;
+  const safeDecode = s => {
+    try { return decodeURIComponent(String(s || '')); } catch { return String(s || ''); }
+  };
   const slug = s =>
-    String(s || '')
+    safeDecode(s)
       .toLowerCase()
       .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-')
       .replace(/^-+|-+$/g, '');
   const alnum = s =>
-    String(s || '')
+    safeDecode(s)
       .toLowerCase()
       .replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
   const targetSlug = slug(inputId);
