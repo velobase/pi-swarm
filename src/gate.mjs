@@ -446,18 +446,37 @@ function estimateBodyTokens(body) {
   return 0;
 }
 
-function rewriteEndpointRequest(url, init, primaryBaseUrl, ep) {
-  if (!ep) return { targetUrl: url, targetInit: init };
+function rewriteEndpointRequest(url, init, primaryBaseUrl, ep, thoughtSigCache) {
   let targetUrl = url;
-  if (primaryBaseUrl && ep.baseUrl && url.startsWith(primaryBaseUrl)) {
+  if (ep && primaryBaseUrl && ep.baseUrl && url.startsWith(primaryBaseUrl)) {
     targetUrl = ep.baseUrl + url.slice(primaryBaseUrl.length);
   }
   let targetInit = init;
-  if (ep.model && typeof init?.body === 'string') {
+  if (typeof init?.body === 'string') {
     try {
       const parsed = JSON.parse(init.body);
-      if (parsed && typeof parsed === 'object' && parsed.model) {
+      let mutated = false;
+      if (ep?.model && parsed && typeof parsed === 'object' && parsed.model) {
         parsed.model = ep.model;
+        mutated = true;
+      }
+      if (thoughtSigCache && Array.isArray(parsed?.messages)) {
+        for (const msg of parsed.messages) {
+          if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+              const sig = tc?.id && thoughtSigCache.get(tc.id);
+              if (sig && !tc.extra_content?.google?.thought_signature) {
+                tc.extra_content = {
+                  ...(tc.extra_content || {}),
+                  google: { ...(tc.extra_content?.google || {}), thought_signature: sig },
+                };
+                mutated = true;
+              }
+            }
+          }
+        }
+      }
+      if (mutated) {
         targetInit = { ...init, body: JSON.stringify(parsed) };
       }
     } catch {}
@@ -477,7 +496,33 @@ export function installGatedFetch({
   const nativeFetch = globalThis.fetch;
   const grants = new Map();
   const retryTracker = new Map();
+  const thoughtSigCache = new Map(); // tool_call.id -> thought_signature (bounded LRU)
   let seq = 0;
+
+  function harvestThoughtSignaturesFromText(text) {
+    if (!text || !text.includes('thought_signature')) return;
+    for (const line of text.split('\n')) {
+      if (!line.includes('thought_signature')) continue;
+      const jsonStr = line.startsWith('data:') ? line.slice(5).trim() : line.trim();
+      try {
+        const obj = JSON.parse(jsonStr);
+        for (const ch of obj.choices || []) {
+          const tcs = ch.delta?.tool_calls || ch.message?.tool_calls || [];
+          for (const tc of tcs) {
+            const id = tc?.id;
+            const sig = tc?.extra_content?.google?.thought_signature;
+            if (id && sig) {
+              thoughtSigCache.set(id, sig);
+              if (thoughtSigCache.size > 50_000) {
+                const oldest = thoughtSigCache.keys().next().value;
+                thoughtSigCache.delete(oldest);
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+  }
 
   process.on('message', m => {
     if (m?.type === 'llm_grant') {
@@ -514,7 +559,13 @@ export function installGatedFetch({
 
     const ep = router ? router.pick() : null;
     const activeAuth = ep?.auth || auth;
-    const { targetUrl, targetInit } = rewriteEndpointRequest(origUrl, init, cleanPrimaryBase, ep);
+    const { targetUrl, targetInit } = rewriteEndpointRequest(
+      origUrl,
+      init,
+      cleanPrimaryBase,
+      ep,
+      thoughtSigCache
+    );
 
     const startedAt = Date.now();
     let released = false;
@@ -572,7 +623,31 @@ export function installGatedFetch({
       clearTimeout(safety);
       release(res.status);
     };
-    const body = res.body.pipeThrough(new TransformStream({ flush: done, cancel: done }));
+    const dec = new TextDecoder();
+    let lineBuf = '';
+    const body = res.body.pipeThrough(
+      new TransformStream({
+        transform(chunk, controller) {
+          try {
+            lineBuf += dec.decode(chunk, { stream: true });
+            const lastNl = lineBuf.lastIndexOf('\n');
+            if (lastNl >= 0) {
+              const completeLines = lineBuf.slice(0, lastNl);
+              lineBuf = lineBuf.slice(lastNl + 1);
+              if (completeLines.includes('thought_signature')) {
+                harvestThoughtSignaturesFromText(completeLines);
+              }
+            }
+          } catch {}
+          controller.enqueue(chunk);
+        },
+        flush() {
+          if (lineBuf.includes('thought_signature')) harvestThoughtSignaturesFromText(lineBuf);
+          done();
+        },
+        cancel: done,
+      })
+    );
     return new Response(body, {
       status: res.status,
       statusText: res.statusText,
