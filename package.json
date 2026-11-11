@@ -1,0 +1,55 @@
+{
+  "name": "@velobase/pi-swarm",
+  "version": "0.1.0",
+  "description": "PostgreSQL-backed high-concurrency autonomous subagent orchestrator for Pi SDK with zero-loss session checkpointing, AIMD upstream rate gating, bounded tool pools, and live SSE telemetry.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "pi-swarm": "./bin/pi-swarm.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./gate": "./src/gate.mjs",
+    "./runtime-db": "./src/runtime-db.mjs",
+    "./builtin-tools": "./src/builtin-tools.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check bin/pi-swarm.mjs src/*.mjs src/dashboard/*.mjs examples/*.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/velobase/pi-swarm.git"
+  },
+  "keywords": [
+    "pi-coding-agent",
+    "subagent",
+    "swarm",
+    "orchestrator",
+    "postgresql",
+    "aimd",
+    "rate-limiting",
+    "llm-batch"
+  ]
+}

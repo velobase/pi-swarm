@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Pi Swarm Live Telemetry</title>
+<style>
+  :root { --bg:#0b0d10; --card:#14181d; --line:#232a32; --fg:#e6e9ee; --mut:#8a94a3; --ok:#3fb950; --bad:#f85149; --warn:#d29922; --acc:#58a6ff; --pur:#bc8cff; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --card:#fff; --line:#e3e6ea; --fg:#1b1f24; --mut:#6b7380; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+  main { max-width:1200px; margin:0 auto; padding:20px 16px 48px; }
+  header { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 16px; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0; }
+  .mut { color:var(--mut); }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .running { background:rgba(88,166,255,.15); color:var(--acc); }
+  .done { background:rgba(63,185,80,.15); color:var(--ok); }
+  .stale { background:rgba(210,153,34,.15); color:var(--warn); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:10px; margin-bottom:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+  .k { font-size:12px; color:var(--mut); }
+  .v { font-size:22px; font-weight:650; font-variant-numeric:tabular-nums; margin-top:2px; }
+  .sub { font-size:11.5px; color:var(--mut); margin-top:2px; }
+  .bar { height:12px; border-radius:999px; background:var(--line); overflow:hidden; display:flex; }
+  .bar > i { display:block; height:100%; transition:width .3s ease; }
+  h2 { font-size:14px; margin:0 0 8px; }
+  .row2 { display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:14px; }
+  @media (min-width:900px) { .row2 { grid-template-columns:1fr 1fr; } }
+  svg { width:100%; height:190px; display:block; }
+  .legend { display:flex; flex-wrap:wrap; gap:12px; font-size:12px; color:var(--mut); margin-top:6px; }
+  .legend b { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td, th { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:500; }
+  code { font-size:12px; word-break:break-all; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">Pi Swarm Live Telemetry</h1>
+    <span id="status" class="pill stale">Connecting</span>
+    <span class="mut" id="meta"></span>
+  </header>
+
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+      <b id="progText">—</b><span class="mut" id="eta"></span>
+    </div>
+    <div class="bar">
+      <i id="barOk" style="background:var(--ok);width:0"></i>
+      <i id="barBackoff" style="background:var(--warn);width:0"></i>
+    </div>
+  </div>
+
+  <div id="customSection" style="display:none">
+    <h2>Business Counters</h2>
+    <div class="grid" id="customTiles" style="margin-top:8px"></div>
+  </div>
+
+  <h2>Swarm & AIMD Gate Telemetry (PostgreSQL-persisted)</h2>
+  <div class="grid" id="swarmTiles" style="margin-top:8px"></div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>Upstream Gate Throughput & AIMD Window (10s intervals)</h2>
+    <svg id="chartGate" viewBox="0 0 600 190" preserveAspectRatio="none"></svg>
+    <div class="legend">
+      <span><b style="background:var(--ok)"></b>200 OK</span>
+      <span><b style="background:var(--bad)"></b>429/503 Backoff</span>
+      <span><b style="background:var(--acc)"></b>Gate Limit</span>
+      <span><b style="background:var(--pur)"></b>Inflight</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Errors</h2>
+    <table>
+      <thead><tr><th>Task</th><th>Detail</th></tr></thead>
+      <tbody id="fails"><tr><td colspan="2" class="mut">None</td></tr></tbody>
+    </table>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => (n ?? 0).toLocaleString();
+const dur = s => s >= 3600 ? `${Math.floor(s/3600)}h${Math.floor(s%3600/60)}m` : s >= 60 ? `${Math.floor(s/60)}m${s%60}s` : `${s}s`;
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function tile(k, v, sub = '', color = '') {
+  return `<div class="card"><div class="k">${esc(k)}</div><div class="v" ${color ? `style="color:${color}"` : ''}>${v}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}</div>`;
+}
+
+function bars(svg, rows, series, lines = []) {
+  const W = 600, H = 190, pad = 4, n = Math.max(rows.length, 1), bw = W / n;
+  const max = Math.max(1, ...rows.map(r => series.reduce((a, s) => a + (r[s.key] || 0), 0)), ...lines.flatMap(l => rows.map(r => r[l.key] || 0)));
+  let out = '';
+  rows.forEach((r, i) => {
+    let y = H;
+    for (const s of series) {
+      const h = (r[s.key] || 0) / max * (H - pad);
+      if (h > 0) { y -= h; out += `<rect x="${i * bw + 0.5}" y="${y}" width="${Math.max(bw - 1, 0.5)}" height="${h}" fill="${css(s.color)}"/>`; }
+    }
+  });
+  for (const l of lines) {
+    const pts = rows.map((r, i) => `${i * bw + bw / 2},${H - (r[l.key] || 0) / max * (H - pad)}`).join(' ');
+    if (rows.length) out += `<polyline points="${pts}" fill="none" stroke="${css(l.color)}" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+  }
+  out += `<text x="4" y="14" font-size="12" fill="${css('--mut')}">Peak ${fmt(Math.round(max))}</text>`;
+  svg.innerHTML = out;
+}
+
+function render({ live, timeline = [], custom = {} }) {
+  if (!live || !live.tasks) {
+    $('status').className = 'pill stale';
+    $('status').textContent = 'Idle';
+    return;
+  }
+  const stale = !live.finishedAt && Date.now() - Date.parse(live.at) > 15000;
+  $('status').className = 'pill ' + (live.finishedAt ? 'done' : stale ? 'stale' : 'running');
+  $('status').textContent = live.finishedAt ? 'Completed' : stale ? 'Paused / Stale' : 'Running';
+  $('title').textContent = live.run?.name || live.run?.id || 'Pi Swarm';
+  $('meta').textContent = `Run ${live.run?.id} · Elapsed ${dur(live.elapsedSec || 0)} · ${live.run?.workers || 0} workers`;
+
+  const t = live.tasks;
+  const pctOk = t.total ? (t.done / t.total * 100) : 0;
+  const pctBo = t.total ? ((t.failed || 0) / t.total * 100) : 0;
+  $('progText').textContent = `${fmt(t.done)} / ${fmt(t.total)} tasks (${pctOk.toFixed(1)}%)`;
+  $('barOk').style.width = pctOk + '%';
+  $('barBackoff').style.width = pctBo + '%';
+  const rate = live.elapsedSec > 0 ? t.done / live.elapsedSec : 0;
+  $('eta').textContent = live.finishedAt ? 'Done' : rate > 0 ? `ETA ${dur(Math.round((t.total - t.done) / rate))}` : '';
+
+  const customEntries = Object.entries(custom || {});
+  if (customEntries.length > 0) {
+    $('customSection').style.display = 'block';
+    $('customTiles').innerHTML = customEntries.map(([k, v]) => tile(k, typeof v === 'number' ? fmt(v) : esc(String(v)))).join('');
+  } else {
+    $('customSection').style.display = 'none';
+  }
+
+  const g = live.gate || {};
+  const last = timeline.at(-1) || {};
+  const poolTiles = Object.entries(live.pools || {}).map(([name, p]) =>
+    tile(`Pool: ${name}`, `${fmt(p.inflight)} / ${fmt(p.limit)}`, `Waiting ${fmt(p.waiting)}${p.perMinute ? ` · 60s ${fmt(p.lastMinute)}/${fmt(p.perMinute)}` : ''}`)
+  );
+
+  $('swarmTiles').innerHTML = [
+    tile('Active Sessions', fmt(t.active), `Resumed from PG: ${fmt(live.resumedSessions || 0)}`),
+    tile('Gate Limit (AIMD)', fmt(g.limit), `Range ${fmt(g.min)}–${fmt(g.max)}`),
+    tile('LLM Inflight', fmt(g.inflight), `Waiting ${fmt(g.waiting)} (Priority ${fmt(g.priorityWaiting || 0)})`),
+    tile('Cooldown', g.coolingMs ? `${(g.coolingMs / 1000).toFixed(1)}s` : '0s', g.coolingMs ? 'Backoff active' : 'Clear', g.coolingMs ? 'var(--warn)' : 'var(--ok)'),
+    tile('LLM 200 / 429', `${fmt(g.total?.ok)} / ${fmt(g.total?.backoff)}`, `Other 4xx: ${fmt(g.total?.other)}`),
+    tile('Pi Retries / Cont.', `${fmt(live.pi?.retries)} / ${fmt(live.pi?.continuations)}`, 'In-session recovery'),
+    tile('Queue Wait p50/p95', last.waitP50 != null ? `${(last.waitP50/1000).toFixed(1)} / ${(last.waitP95/1000).toFixed(1)}s` : '—', 'Gate grant wait'),
+    ...poolTiles,
+  ].join('');
+
+  bars(
+    $('chartGate'),
+    timeline.map(r => ({ ok: r.window?.ok || 0, bad: r.window?.backoff || 0, limit: r.limit || 0, inflight: r.inflight || 0 })),
+    [{ key: 'ok', color: '--ok' }, { key: 'bad', color: '--bad' }],
+    [{ key: 'limit', color: '--acc' }, { key: 'inflight', color: '--pur' }]
+  );
+
+  $('fails').innerHTML = (live.recentFailures || []).length
+    ? live.recentFailures.slice().reverse().map(f => `<tr><td><code>${esc(f.id)}</code></td><td><code>${esc(f.error)}</code></td></tr>`).join('')
+    : '<tr><td colspan="2" class="mut">None</td></tr>';
+}
+
+function connect() {
+  const es = new EventSource('events');
+  es.onmessage = e => render(JSON.parse(e.data));
+  es.onerror = () => { $('status').className = 'pill stale'; $('status').textContent = 'Reconnecting'; };
+}
+connect();
+</script>
+</body>
+</html>
