@@ -100,25 +100,56 @@ export function defineSwarm(config) {
     retainSessions: false,
     httpIdleTimeoutMs: 30 * 60_000,
     maxContinuations: 5,
+    stallTimeoutMs: 10 * 60_000,
+    budgetUsd: null,
+    webhookUrl: null,
+    sessionAdmission: {
+      enabled: true,
+      perGateSlot: 3,
+      minActive: 100,
+      ...(config.sessionAdmission || {}),
+    },
+    circuitBreaker: {
+      enabled: true,
+      minRequests: 20,
+      fatalShare: 0.5,
+      ...(config.circuitBreaker || {}),
+    },
+    taskRetries: {
+      maxFailures: 5,
+      baseDelayMs: 4000,
+      maxDelayMs: 60_000,
+      ...(config.taskRetries || {}),
+    },
     retry: {
       enabled: true,
       maxRetries: 30,
       baseDelayMs: 1000,
       maxAgentDelayMs: 15_000,
+      ...(config.retry || {}),
     },
     gate: {
       limit: 300,
       min: 50,
       max: 1500,
+      tpm: 0,
       increaseStep: 0.1,
       decreaseFactor: 0.7,
       cooldownMinMs: 2000,
       cooldownJitterMs: 3000,
+      ...(config.gate || {}),
     },
     pools: {},
     ...config,
   };
 }
 
-export { Gate, SlotPool, createGcloudVertexAuth, createStaticAuth } from './gate.mjs';
+export {
+  Gate,
+  SlotPool,
+  EndpointRouter,
+  createGcloudVertexAuth,
+  createStaticAuth,
+  resolveAuthSpec,
+} from './gate.mjs';
 export { RuntimeDb } from './runtime-db.mjs';

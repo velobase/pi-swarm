@@ -1,6 +1,6 @@
 {
   "name": "@velobase/pi-swarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "PostgreSQL-backed high-concurrency autonomous subagent orchestrator for Pi SDK with zero-loss session checkpointing, AIMD upstream rate gating, bounded tool pools, and live SSE telemetry.",
   "license": "MIT",
   "type": "module",

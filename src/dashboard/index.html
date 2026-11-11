@@ -24,12 +24,12 @@
   .section { margin-bottom:14px; }
   .banner { border-radius:12px; padding:10px 14px; margin-bottom:14px; font-weight:600; }
   .grid { display:grid; gap:10px; }
-  .kpis { grid-template-columns:repeat(4,1fr); }
+  .kpis { grid-template-columns:repeat(5,1fr); }
   .tiles { grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
   .two { grid-template-columns:1fr 1fr; }
-  @media (max-width:820px) { .kpis { grid-template-columns:1fr 1fr; } .two { grid-template-columns:1fr; } }
+  @media (max-width:980px) { .kpis { grid-template-columns:1fr 1fr; } .two { grid-template-columns:1fr; } }
   .k { font-size:12px; color:var(--mut); }
-  .v { font-size:24px; font-weight:650; margin-top:2px; }
+  .v { font-size:22px; font-weight:650; margin-top:2px; }
   .sub { font-size:11.5px; color:var(--mut); margin-top:2px; }
   .bar { height:12px; border-radius:999px; background:var(--line); overflow:hidden; display:flex; }
   .bar > i { display:block; height:100%; transition:width .4s ease; }
@@ -50,10 +50,22 @@
   td.r, th.r { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
   td.nw { white-space:nowrap; }
   code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-word; }
+  a.tlink { color:var(--acc); text-decoration:none; cursor:pointer; font:12px ui-monospace,Menlo,monospace; }
+  a.tlink:hover { text-decoration:underline; }
   details > summary { cursor:pointer; list-style:none; }
   details > summary::-webkit-details-marker { display:none; }
   details pre { margin:8px 0 0; padding:8px; background:var(--card2); border-radius:8px; white-space:pre-wrap; word-break:break-word; font:12px ui-monospace,Menlo,monospace; }
   .hbar { display:grid; grid-template-columns:minmax(90px,34%) 1fr auto; gap:8px; align-items:center; font-size:12.5px; padding:3px 0; }
+  .lookup { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+  .lookup input { background:var(--card2); border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:5px 10px; font-size:12.5px; width:180px; }
+  .lookup button { background:var(--acc); color:#fff; border:none; border-radius:8px; padding:5px 12px; font-size:12px; font-weight:600; cursor:pointer; }
+  .drawer-bg { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:50; padding:16px; }
+  .drawer { background:var(--card); border:1px solid var(--line); border-radius:14px; max-width:920px; width:100%; max-height:86vh; display:flex; flex-direction:column; overflow:hidden; }
+  .drawer-hd { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); }
+  .drawer-bd { padding:14px 16px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; }
+  .turn { background:var(--card2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12.5px; }
+  .turn .role { font-weight:700; font-size:11.5px; text-transform:uppercase; margin-bottom:4px; }
+  .turn pre { margin:4px 0 0; white-space:pre-wrap; word-break:break-word; font:12px ui-monospace,Menlo,monospace; max-height:280px; overflow-y:auto; }
 </style>
 </head>
 <body>
@@ -94,7 +106,16 @@
   <div class="card section">
     <h2 id="h-pools"></h2>
     <div class="tablewrap"><table><thead id="poolsHead"></thead><tbody id="pools"></tbody></table></div>
+    <div id="endpointsWrap" style="display:none;margin-top:12px">
+      <h2 id="h-endpoints"></h2>
+      <div class="tablewrap"><table><thead id="epHead"></thead><tbody id="endpoints"></tbody></table></div>
+    </div>
     <div class="grid tiles" id="metrics" style="margin-top:12px"></div>
+  </div>
+
+  <div id="failedSection" class="card section" style="display:none">
+    <h2 id="h-failed"></h2>
+    <div class="tablewrap"><table><thead id="failHead"></thead><tbody id="failedBody"></tbody></table></div>
   </div>
 
   <div class="grid two section">
@@ -103,23 +124,48 @@
       <div id="errors"></div>
     </div>
     <div class="card">
-      <h2 id="h-longest"></h2>
-      <div class="tablewrap"><table><thead id="longHead"></thead><tbody id="longest"></tbody></table></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <h2 id="h-longest" style="margin:0"></h2>
+        <form class="lookup" id="inspectForm" style="margin:0">
+          <input id="inspectInput" placeholder="Task ID (e.g. 0001)" />
+          <button type="submit" id="inspectBtn">Inspect</button>
+        </form>
+      </div>
+      <div class="tablewrap" style="margin-top:8px"><table><thead id="longHead"></thead><tbody id="longest"></tbody></table></div>
     </div>
   </div>
 </main>
+
+<div class="drawer-bg" id="drawerBg">
+  <div class="drawer">
+    <div class="drawer-hd">
+      <b id="drawerTitle">Task</b>
+      <button id="drawerClose" style="background:none;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer">✕</button>
+    </div>
+    <div class="drawer-bd" id="drawerBody"></div>
+  </div>
+</div>
+
 <script>
 const ZH = (navigator.language || '').toLowerCase().startsWith('zh');
 const T = ZH ? {
-  running:'运行中', done:'已完成', stale:'无更新', idle:'未启动', reconnect:'重连中',
+  running:'运行中', paused:'已暂停', done:'已完成', stale:'无更新', idle:'未启动', reconnect:'重连中',
   elapsed:'已运行', workers:'个 worker', updated:'更新于', eta:'预计剩余', rateUnit:'/分钟',
   remaining:'剩余', tasksUnit:'任务',
-  kRate:'产出速度', kRateSub:'近 5 分钟平均', kWait:'排队等待 p95', kWaitSub:(t)=>`超时上限 ${t}`, kOk:'模型请求成功率', kOkSub:'近 60 秒', kSess:'活跃会话', kSessSub:(r,b)=>`从存档恢复 ${r} · 退避中 ${b}`,
-  hResults:'模型请求结果（每 10 秒）', hGate:'名额与排队', hPools:'资源池与指标', hErrors:'错误归类', hLongest:'运行最久的任务',
+  kRate:'产出速度', kRateSub:'近 5 分钟平均', kWait:'排队等待 p95', kWaitSub:(t)=>`超时上限 ${t}`, kOk:'模型请求成功率', kOkSub:'近 60 秒',
+  kSess:'活跃会话', kSessSub:(cap,r,b)=>`准入上限 ${cap} · 恢复 ${r} · 退避 ${b}`,
+  kCost:'Token 与花费', kCostSub:(i,o)=>`输入 ${i} · 输出 ${o}`,
+  hResults:'模型请求结果（每 10 秒）', hGate:'名额与排队', hPools:'资源池与指标', hEndpoints:'多端点 / 备用模型路由',
+  hFailed:'失败任务（已达最大重试次数，点击查看会话）', hErrors:'错误归类', hLongest:'运行最久的任务（点击查看会话）',
   ok:'成功', backoff:'限流 429/503', net:'中断/超时', other:'其他错误', limit:'名额上限', inflight:'在途', waiting:'排队',
-  pool:'资源池', used:'在途 / 上限', lastMin:'近 60 秒 / 每分钟上限', gate:'模型请求', none:'暂无', task:'任务', runFor:'已运行', attempt:'第几次尝试', count:'次数', last:'最近',
-  noLimit:'不限', collecting:'统计中', retries:'会话内重试', continuations:'续跑', priority:'其中重试优先',
-  health:{ idle:'尚未启动', finished:'全部完成', stale:p=>`已有 ${p.ageSec} 秒没有更新，调度进程可能已停止`,
+  pool:'资源池', used:'在途 / 上限', lastMin:'近 60 秒 / 每分钟上限', gate:'模型请求', none:'暂无', task:'任务', runFor:'已运行', attempt:'尝试', failures:'失败次数', error:'错误',
+  noLimit:'不限', collecting:'统计中', retries:'会话内重试', continuations:'续跑', stalled:'卡死中断', priority:'其中重试优先', inspect:'查看会话',
+  health:{ idle:'尚未启动', finished:'全部完成',
+    finished_with_failures:p=>`运行结束：完成 ${p.done} 个，失败 ${p.failed} 个（可用 pi-swarm retry 重跑失败项）`,
+    circuit_breaker:p=>`已自动熔断暂停：${p.reason}（修复后执行 pi-swarm resume 继续）`,
+    budget_exceeded:p=>`已达预算上限自动暂停：${p.reason}（可用 pi-swarm budget --usd <新预算> 放行）`,
+    paused:p=>`已暂停：${p.reason}（执行 pi-swarm resume 继续）`,
+    stale:p=>`已有 ${p.ageSec} 秒没有更新，调度进程可能已停止`,
     upstream_errors:p=>`上游大量报错：近 60 秒 ${pct(p.share)} 的请求返回错误（${p.count} 次），请检查鉴权或接口`,
     queue_wait:p=>`排队过长：等待 p95 已到 ${fmtSec(p.waitSec)}，超时上限是 ${fmtSec(p.timeoutSec)}`,
     network_failures:p=>`请求中断偏多：近 60 秒 ${pct(p.share)}（${p.count} 次）`,
@@ -127,16 +173,24 @@ const T = ZH ? {
     no_progress:()=>'近 5 分钟没有新的完成量',
     healthy:p=>p.ratePerMin==null?'运行正常，速度统计中':`运行正常，约 ${fmtRate(p.ratePerMin)} 个/分钟` },
 } : {
-  running:'Running', done:'Completed', stale:'Stale', idle:'Idle', reconnect:'Reconnecting',
+  running:'Running', paused:'Paused', done:'Completed', stale:'Stale', idle:'Idle', reconnect:'Reconnecting',
   elapsed:'Elapsed', workers:'workers', updated:'updated', eta:'ETA', rateUnit:'/min',
   remaining:'remaining', tasksUnit:'tasks',
-  kRate:'Throughput', kRateSub:'5-minute average', kWait:'Queue wait p95', kWaitSub:(t)=>`timeout ${t}`, kOk:'LLM success rate', kOkSub:'last 60s', kSess:'Active sessions', kSessSub:(r,b)=>`resumed ${r} · backoff ${b}`,
-  hResults:'LLM request results (per 10s)', hGate:'Gate limit and queue', hPools:'Resource pools and metrics', hErrors:'Errors by type', hLongest:'Longest-running tasks',
+  kRate:'Throughput', kRateSub:'5-minute average', kWait:'Queue wait p95', kWaitSub:(t)=>`timeout ${t}`, kOk:'LLM success rate', kOkSub:'last 60s',
+  kSess:'Active sessions', kSessSub:(cap,r,b)=>`cap ${cap} · resumed ${r} · backoff ${b}`,
+  kCost:'Tokens & Cost', kCostSub:(i,o)=>`in ${i} · out ${o}`,
+  hResults:'LLM request results (per 10s)', hGate:'Gate limit and queue', hPools:'Resource pools and metrics', hEndpoints:'Endpoint & fallback routing',
+  hFailed:'Failed tasks (max retries reached — click ID to inspect)', hErrors:'Errors by type', hLongest:'Longest-running tasks (click ID to inspect)',
   ok:'OK', backoff:'429/503', net:'Aborted/timeout', other:'Other errors', limit:'Limit', inflight:'In flight', waiting:'Waiting',
-  pool:'Pool', used:'In flight / limit', lastMin:'Last 60s / per-minute cap', gate:'LLM requests', none:'None', task:'Task', runFor:'Running for', attempt:'Attempt', count:'Count', last:'Last',
-  noLimit:'no cap', collecting:'collecting', retries:'in-session retries', continuations:'continuations', priority:'priority retries',
-  health:{ idle:'Not started', finished:'All done', stale:p=>`No update for ${p.ageSec}s; the supervisor may be down`,
-    upstream_errors:p=>`Upstream errors: ${pct(p.share)} of requests failed in the last 60s (${p.count}); check auth or endpoint`,
+  pool:'Pool', used:'In flight / limit', lastMin:'Last 60s / per-minute cap', gate:'LLM requests', none:'None', task:'Task', runFor:'Running for', attempt:'Attempt', failures:'Failures', error:'Error',
+  noLimit:'no cap', collecting:'collecting', retries:'in-session retries', continuations:'continuations', stalled:'stalled aborts', priority:'priority retries', inspect:'Inspect',
+  health:{ idle:'Not started', finished:'All done',
+    finished_with_failures:p=>`Finished: ${p.done} complete, ${p.failed} failed (run pi-swarm retry to re-run failed tasks)`,
+    circuit_breaker:p=>`Circuit breaker tripped (paused): ${p.reason} — fix issue then run pi-swarm resume`,
+    budget_exceeded:p=>`Paused at budget cap: ${p.reason} — raise with pi-swarm budget --usd <amount>`,
+    paused:p=>`Paused: ${p.reason} — run pi-swarm resume to continue`,
+    stale:p=>`No update for ${p.ageSec}s; the supervisor may be down`,
+    upstream_errors:p=>`Upstream errors: ${pct(p.share)} of requests failed in the last 60s (${p.count})`,
     queue_wait:p=>`Queue is too long: p95 wait ${fmtSec(p.waitSec)} against a ${fmtSec(p.timeoutSec)} timeout`,
     network_failures:p=>`Many aborted requests: ${pct(p.share)} in the last 60s (${p.count})`,
     rate_limited:p=>`Upstream is rate limiting: ${pct(p.share)} of requests got 429/503; the gate is backing off`,
@@ -144,9 +198,12 @@ const T = ZH ? {
     healthy:p=>p.ratePerMin==null?'Healthy, measuring throughput':`Healthy, about ${fmtRate(p.ratePerMin)} items/min` },
 };
 document.documentElement.lang = ZH ? 'zh-CN' : 'en';
+$('inspectBtn').textContent = T.inspect;
 
-const $ = id => document.getElementById(id);
+const $id = id => document.getElementById(id);
+function $(id) { return $id(id); }
 const fmt = n => (Number(n) || 0).toLocaleString();
+const fmtTok = n => { n = Number(n) || 0; return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n); };
 const fmtRate = n => n >= 10 ? Math.round(n).toLocaleString() : (Math.round(n * 10) / 10).toString();
 const pct = x => (x * 100).toFixed(x < 0.1 ? 1 : 0) + '%';
 const fmtSec = s => { s = Math.round(s); return s >= 3600 ? `${Math.floor(s/3600)}h${Math.floor(s%3600/60)}m` : s >= 60 ? `${Math.floor(s/60)}m${s%60}s` : `${s}s`; };
@@ -154,16 +211,16 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const hhmm = iso => iso ? new Date(iso).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }) : '';
 const TONE = { ok:'--ok', success:'--ok', warn:'--warn', warning:'--warn', crit:'--bad', error:'--bad', info:'--acc', muted:'--gray', neutral:'--gray' };
-const SEG_COLORS = ['--ok', '--warn', '--acc', '--pur', '--gray'];
 const TONE_CLASS = { ok:'ok', success:'ok', warn:'warn', warning:'warn', crit:'crit', error:'crit', info:'info' };
+const SEG_COLORS = ['--ok', '--warn', '--acc', '--pur', '--gray'];
 const toneVar = (tone, i = 0) => TONE[tone] || SEG_COLORS[i % SEG_COLORS.length];
 
-function tile(k, v, sub = '', tone = '') {
-  return `<div class="card"><div class="k">${esc(k)}</div><div class="v num ${tone ? 't-' + tone : ''}">${v}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}</div>`;
+function tile(k, v, sub = '', tone = '', extraHtml = '') {
+  return `<div class="card"><div class="k">${esc(k)}</div><div class="v num ${tone ? 't-' + tone : ''}">${v}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ''}${extraHtml}</div>`;
 }
 function legend(el, items) { el.innerHTML = items.map(([label, color]) => `<span><b style="background:var(${color})"></b>${esc(label)}</span>`).join(''); }
+function taskLink(id) { return `<a class="tlink" data-task="${esc(id)}">${esc(id)}</a>`; }
 
-/* Chart: stacked bars and/or lines over the same rows, own y-axis per chart, hover tooltip. */
 const chartState = new WeakMap();
 function chart(el, rows, { bars = [], lines = [] }) {
   const W = 600, H = 150, n = Math.max(rows.length, 1), bw = W / n;
@@ -216,7 +273,7 @@ function renderPanel(p) {
   }
   if (p.type === 'bars') {
     const items = (p.items || []).slice(0, 20), max = Math.max(1, ...items.map(i => Number(i.value) || 0));
-    return `<div class="card section">${title}${items.map((it, i) => `<div class="hbar"><span>${esc(it.label)}</span><div class="mini"><i style="width:${(Number(it.value) || 0) / max * 100}%;background:var(${toneVar(it.tone, 2)})"></i></div><b class="num">${fmt(it.value)}${p.unit ? ' ' + esc(p.unit) : ''}</b></div>`).join('') || `<div class="mut">${T.none}</div>`}</div>`;
+    return `<div class="card section">${title}${items.map(it => `<div class="hbar"><span>${esc(it.label)}</span><div class="mini"><i style="width:${(Number(it.value) || 0) / max * 100}%;background:var(${toneVar(it.tone, 2)})"></i></div><b class="num">${fmt(it.value)}${p.unit ? ' ' + esc(p.unit) : ''}</b></div>`).join('') || `<div class="mut">${T.none}</div>`}</div>`;
   }
   return `<div class="card section">${title}<div style="white-space:pre-wrap">${esc(p.text || '')}</div></div>`;
 }
@@ -231,41 +288,46 @@ function render(s) {
   $('banner').textContent = typeof hm === 'function' ? hm(health.params || {}) : (hm || '');
   if (!live || !live.tasks) { $('status').className = 'pill b-info'; $('status').textContent = T.idle; return; }
 
-  $('status').className = 'pill ' + (live.finishedAt ? 'b-ok' : health.code === 'stale' ? 'b-warn' : 'b-info');
-  $('status').textContent = live.finishedAt ? T.done : health.code === 'stale' ? T.stale : T.running;
+  const pillCls = live.finishedAt ? 'b-ok' : live.paused ? 'b-warn' : health.code === 'stale' ? 'b-warn' : 'b-info';
+  const pillTxt = live.finishedAt ? T.done : live.paused ? T.paused : health.code === 'stale' ? T.stale : T.running;
+  $('status').className = 'pill ' + pillCls;
+  $('status').textContent = pillTxt;
   $('title').textContent = live.run?.name || live.run?.id || 'pi-swarm';
-  document.title = `${Math.floor(progress.total ? progress.done / progress.total * 100 : 0)}% · ${live.run?.name || 'pi-swarm'}`;
+  const total = progress.total || 0, done = progress.done || 0;
+  document.title = `${Math.floor(total ? done / total * 100 : 0)}% · ${live.run?.name || 'pi-swarm'}`;
   $('meta').textContent = `${live.run?.id} · ${T.elapsed} ${fmtSec(live.elapsedSec || 0)} · ${live.run?.workers || 0} ${T.workers} · ${T.updated} ${hhmm(live.at)}`;
 
-  /* progress */
   const unit = progress.source === 'tasks' ? T.tasksUnit : (progress.unit || '');
-  const total = progress.total || 0, done = progress.done || 0;
   const pctDone = total ? (done / total * 100).toFixed(1) : '0.0';
   $('progText').textContent = ZH
     ? `${fmt(done)} / ${fmt(total)} ${unit}（${pctDone}%）· ${T.remaining} ${fmt(progress.remaining)}`
     : `${fmt(done)} / ${fmt(total)} ${unit} (${pctDone}%) · ${fmt(progress.remaining)} ${T.remaining}`;
-  const segs = progress.segments?.length ? progress.segments : [{ label: T.done, value: done, tone: 'ok' }];
+  const segs = Array.isArray(progress.segments) ? [...progress.segments] : [{ label: T.done, value: done, tone: 'ok' }];
+  if (progress.source === 'tasks' && (live.tasks.failed || 0) > 0) {
+    segs.push({ label: T.failures, value: live.tasks.failed, tone: 'crit' });
+  }
   $('progBar').innerHTML = segs.map((g, i) => `<i style="width:${total ? (Number(g.value) || 0) / total * 100 : 0}%;background:var(${toneVar(g.tone, i)})" title="${esc(g.label)}"></i>`).join('');
-  $('progLegend').innerHTML = progress.segments?.length ? segs.map((g, i) => `<span><b style="background:var(${toneVar(g.tone, i)})"></b>${esc(g.label)} <b class="num" style="background:none;width:auto;height:auto;color:var(--fg)">${fmt(g.value)}</b></span>`).join('') : '';
+  $('progLegend').innerHTML = segs.length > 1 || progress.segments?.length ? segs.map((g, i) => `<span><b style="background:var(${toneVar(g.tone, i)})"></b>${esc(g.label)} <b class="num" style="background:none;width:auto;height:auto;color:var(--fg)">${fmt(g.value)}</b></span>`).join('') : '';
   $('eta').textContent = live.finishedAt ? '' : progress.etaSec != null ? `${T.eta} ${fmtSec(progress.etaSec)}` : '';
 
-  /* KPIs */
-  const g = live.gate || {}, t = live.tasks, last = timeline.at(-1) || {};
+  const g = live.gate || {}, t = live.tasks, last = timeline.at(-1) || {}, u = live.usage || {};
   const recent = timeline.slice(-6).reduce((a, r) => ({ ok: a.ok + (r.window?.ok || 0), all: a.all + (r.window?.ok || 0) + (r.window?.backoff || 0) + (r.window?.other || 0) + (r.window?.net || 0) }), { ok: 0, all: 0 });
   const okShare = recent.all ? recent.ok / recent.all : null;
   const waitMs = Number(last.waitP95) || 0;
   const waitTone = timeoutMs && waitMs >= timeoutMs * 0.8 ? 'crit' : timeoutMs && waitMs >= timeoutMs * 0.5 ? 'warn' : '';
+  const costVal = u.costUsd > 0 || live.budgetUsd ? `$${(Number(u.costUsd) || 0).toFixed(2)}` : fmtTok((u.inputTokens || 0) + (u.outputTokens || 0));
+  const budgetBar = live.budgetUsd > 0 ? `<div class="mini" style="margin-top:6px"><i style="width:${Math.min(100, (u.costUsd || 0) / live.budgetUsd * 100)}%;background:var(${(u.costUsd || 0) >= live.budgetUsd ? '--bad' : '--ok'})"></i></div><div class="sub num">$${(u.costUsd || 0).toFixed(3)} / $${Number(live.budgetUsd).toFixed(2)}</div>` : '';
+
   $('kpis').innerHTML = [
     tile(T.kRate, progress.ratePerMin == null ? '—' : `${fmtRate(progress.ratePerMin)}<span class="sub"> ${esc(unit)}${T.rateUnit}</span>`, progress.ratePerMin == null ? T.collecting : T.kRateSub, progress.ratePerMin === 0 ? 'warn' : ''),
     tile(T.kWait, last.waitP95 != null ? fmtSec(waitMs / 1000) : '—', timeoutMs ? T.kWaitSub(fmtSec(timeoutMs / 1000)) : `p50 ${fmtSec((Number(last.waitP50) || 0) / 1000)}`, waitTone),
     tile(T.kOk, okShare == null ? '—' : pct(okShare), `${T.kOkSub} · ${fmt(recent.ok)} / ${fmt(recent.all)}`, okShare == null ? '' : okShare < 0.5 ? 'crit' : okShare < 0.8 ? 'warn' : 'ok'),
-    tile(T.kSess, fmt(t.active), T.kSessSub(fmt(live.resumedSessions || 0), fmt(t.backoff ?? t.failed ?? 0))),
+    tile(T.kSess, fmt(t.active), T.kSessSub(fmt(live.sessionCap || t.total), fmt(live.resumedSessions || 0), fmt(t.backoff ?? 0))),
+    tile(T.kCost, costVal, T.kCostSub(fmtTok(u.inputTokens), fmtTok(u.outputTokens)), '', budgetBar),
   ].join('');
 
-  /* job-defined panels */
   $('panels').innerHTML = panels.map(renderPanel).join('');
 
-  /* charts */
   $('h-results').textContent = T.hResults; $('h-gate').textContent = T.hGate;
   const rows = timeline.map(r => ({ at: r.at, ok: r.window?.ok || 0, backoff: r.window?.backoff || 0, net: r.window?.net || 0, other: r.window?.other || 0, limit: r.limit || 0, inflight: r.inflight || 0, waiting: r.waiting || 0 }));
   const S1 = [{ key:'ok', color:'--ok', label:T.ok }, { key:'backoff', color:'--warn', label:T.backoff }, { key:'net', color:'--gray', label:T.net }, { key:'other', color:'--bad', label:T.other }];
@@ -273,30 +335,85 @@ function render(s) {
   chart($('chartResults'), rows, { bars: S1 }); legend($('lg-results'), S1.map(x => [x.label, x.color]));
   chart($('chartGate'), rows, { lines: S2 }); legend($('lg-gate'), S2.map(x => [x.label, x.color]));
 
-  /* pools + metrics */
   $('h-pools').textContent = T.hPools;
   $('poolsHead').innerHTML = `<tr><th>${T.pool}</th><th>${T.used}</th><th class="r">${T.waiting}</th><th>${T.lastMin}</th></tr>`;
   const poolRow = (name, inflight, limit, waiting, lastMinute, perMinute, extra = '') => `<tr><td class="nw"><b>${esc(name)}</b>${extra ? `<div class="sub">${esc(extra)}</div>` : ''}</td>
     <td style="min-width:150px"><span class="num">${fmt(inflight)} / ${fmt(limit)}</span><div class="mini" style="margin-top:4px"><i style="width:${limit ? Math.min(100, inflight / limit * 100) : 0}%"></i></div></td>
     <td class="r ${waiting > 0 ? 't-warn' : ''}">${fmt(waiting)}</td>
     <td style="min-width:150px">${perMinute ? `<span class="num">${fmt(lastMinute)} / ${fmt(perMinute)}</span><div class="mini" style="margin-top:4px"><i style="width:${Math.min(100, lastMinute / perMinute * 100)}%"></i></div>` : `<span class="mut">${T.noLimit}</span>`}</td></tr>`;
-  $('pools').innerHTML = poolRow(T.gate, g.inflight || 0, g.limit || 0, g.waiting || 0, 0, 0, `${fmt(g.min)}–${fmt(g.max)} · ${T.priority} ${fmt(g.priorityWaiting || 0)}`) +
+  $('pools').innerHTML = poolRow(T.gate, g.inflight || 0, g.limit || 0, g.waiting || 0, g.tokensLastMinute || 0, g.tpm || 0, `${fmt(g.min)}–${fmt(g.max)} · ${T.priority} ${fmt(g.priorityWaiting || 0)}`) +
     Object.entries(live.pools || {}).map(([name, p]) => poolRow(name, p.inflight, p.limit, p.waiting, p.lastMinute || 0, p.perMinute || 0)).join('');
+
+  const epEntries = Object.entries(live.endpoints || {});
+  if (epEntries.length > 0) {
+    $('endpointsWrap').style.display = 'block';
+    $('h-endpoints').textContent = T.hEndpoints;
+    $('epHead').innerHTML = `<tr><th>Endpoint</th><th class="r">${T.ok}</th><th class="r">${T.backoff}</th><th class="r">${T.other}</th></tr>`;
+    $('endpoints').innerHTML = epEntries.map(([name, st]) => `<tr><td><code>${esc(name)}</code></td><td class="r">${fmt(st.ok)}</td><td class="r">${fmt(st.backoff)}</td><td class="r">${fmt(st.other)}</td></tr>`).join('');
+  } else {
+    $('endpointsWrap').style.display = 'none';
+  }
+
   $('metrics').innerHTML = [
-    tile(T.retries, fmt(live.pi?.retries), `${T.continuations} ${fmt(live.pi?.continuations)}`),
+    tile(T.retries, fmt(live.pi?.retries), `${T.continuations} ${fmt(live.pi?.continuations)} · ${T.stalled} ${fmt(live.pi?.stalledAborts || 0)}`),
     ...Object.entries(live.metrics || {}).map(([name, val]) => { const m = metricsMeta[name] || {}; return tile(m.label || name, fmt(val) + (m.unit ? `<span class="sub"> ${esc(m.unit)}</span>` : ''), m.label ? name : ''); }),
   ].join('');
 
-  /* errors */
+  const failedList = live.failedTasks || [];
+  if (failedList.length > 0) {
+    $('failedSection').style.display = 'block';
+    $('h-failed').textContent = `${T.hFailed} (${fmt(live.tasks.failed)})`;
+    $('failHead').innerHTML = `<tr><th>${T.task}</th><th class="r">${T.failures}</th><th>${T.error}</th></tr>`;
+    $('failedBody').innerHTML = failedList.map(f => `<tr><td class="nw">${taskLink(f.id)}</td><td class="r t-crit">${fmt(f.failures)}</td><td><code>${esc(f.error || '')}</code></td></tr>`).join('');
+  } else {
+    $('failedSection').style.display = 'none';
+  }
+
   $('h-errors').textContent = T.hErrors; $('h-longest').textContent = T.hLongest;
   document.querySelectorAll('#errors details[open]').forEach(d => openErrors.add(d.dataset.k));
   document.querySelectorAll('#errors details:not([open])').forEach(d => openErrors.delete(d.dataset.k));
   const groups = live.errorGroups || [];
-  $('errors').innerHTML = groups.length ? groups.map(e => `<details data-k="${esc(e.key)}" ${openErrors.has(e.key) ? 'open' : ''}><summary><div class="hbar" style="grid-template-columns:auto 1fr auto"><b class="num pill b-warn">${fmt(e.count)}</b><code>${esc(e.key)}</code><span class="mut nw">${hhmm(e.lastAt)}</span></div></summary><pre>${T.task} ${esc(e.lastTask)}\n${esc(e.sample)}</pre></details>`).join('') : `<div class="mut">${T.none}</div>`;
+  $('errors').innerHTML = groups.length ? groups.map(e => `<details data-k="${esc(e.key)}" ${openErrors.has(e.key) ? 'open' : ''}><summary><div class="hbar" style="grid-template-columns:auto 1fr auto"><b class="num pill b-warn">${fmt(e.count)}</b><code>${esc(e.key)}</code><span class="mut nw">${hhmm(e.lastAt)}</span></div></summary><pre>${T.task} ${taskLink(e.lastTask)}\n${esc(e.sample)}</pre></details>`).join('') : `<div class="mut">${T.none}</div>`;
   $('longHead').innerHTML = `<tr><th>${T.task}</th><th class="r">${T.runFor}</th><th class="r">${T.attempt}</th></tr>`;
   const longest = live.longestRunning || [];
-  $('longest').innerHTML = longest.length ? longest.map(x => `<tr><td><code>${esc(x.id)}</code></td><td class="r">${fmtSec(x.runningSec)}</td><td class="r">${fmt(x.attempt)}</td></tr>`).join('') : `<tr><td colspan="3" class="mut">${T.none}</td></tr>`;
+  $('longest').innerHTML = longest.length ? longest.map(x => `<tr><td>${taskLink(x.id)}</td><td class="r">${fmtSec(x.runningSec)}</td><td class="r">${fmt(x.attempt)}</td></tr>`).join('') : `<tr><td colspan="3" class="mut">${T.none}</td></tr>`;
 }
+
+async function openInspect(taskId) {
+  if (!taskId) return;
+  $('drawerTitle').textContent = `${T.task} ${taskId}`;
+  $('drawerBody').innerHTML = `<div class="mut">Loading…</div>`;
+  $('drawerBg').style.display = 'flex';
+  try {
+    const r = await fetch(`api/task?id=${encodeURIComponent(taskId)}`);
+    const d = await r.json();
+    if (!r.ok) { $('drawerBody').innerHTML = `<div class="t-crit">${esc(d.error || 'Not found')}</div>`; return; }
+    const headerHtml = `<div class="turn"><b>Status:</b> ${esc(d.status)} · <b>Attempt:</b> ${d.attempt} · <b>Failures:</b> ${d.failures} · <b>Tokens:</b> ${fmt(d.input_tokens)} in / ${fmt(d.output_tokens)} out ($${Number(d.cost_usd || 0).toFixed(4)})${d.last_error ? `<pre class="t-crit">${esc(d.last_error)}</pre>` : ''}</div>`;
+    const entries = (d.entries || []).filter(e => e.type === 'message' || e.message);
+    const turnsHtml = entries.length ? entries.map(e => {
+      const m = e.message || e;
+      const role = m.role || e.type || 'entry';
+      const body = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? m, null, 2);
+      const errLine = m.errorMessage ? `\n[ERROR] ${m.errorMessage}` : '';
+      return `<div class="turn"><div class="role ${role === 'assistant' ? 't-info' : role === 'toolResult' ? 't-ok' : ''}">${esc(role)}${m.stopReason ? ` (${esc(m.stopReason)})` : ''}</div><pre>${esc(body + errLine)}</pre></div>`;
+    }).join('') : `<div class="mut">No session checkpoint stored (completed sessions are pruned unless retainSessions or sample mode is enabled).</div>`;
+    $('drawerBody').innerHTML = headerHtml + turnsHtml;
+  } catch (err) {
+    $('drawerBody').innerHTML = `<div class="t-crit">${esc(err.message)}</div>`;
+  }
+}
+
+document.addEventListener('click', ev => {
+  const a = ev.target.closest('a.tlink');
+  if (a && a.dataset.task) { ev.preventDefault(); void openInspect(a.dataset.task); }
+});
+$('inspectForm').addEventListener('submit', ev => {
+  ev.preventDefault();
+  const v = $('inspectInput').value.trim();
+  if (v) void openInspect(v);
+});
+$('drawerClose').addEventListener('click', () => { $('drawerBg').style.display = 'none'; });
+$('drawerBg').addEventListener('click', ev => { if (ev.target === $('drawerBg')) $('drawerBg').style.display = 'none'; });
 
 function connect() {
   const es = new EventSource('events');

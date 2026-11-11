@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
   gate_limit  double precision NOT NULL DEFAULT 300,
   pools       jsonb NOT NULL DEFAULT '{}'::jsonb,
   metrics     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  usage       jsonb NOT NULL DEFAULT '{}'::jsonb,
+  budget_usd  double precision,
   snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb,
   timeline    jsonb NOT NULL DEFAULT '[]'::jsonb,
   started_at  timestamptz NOT NULL DEFAULT now(),
@@ -21,18 +23,30 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
   finished_at timestamptz
 );
 
+ALTER TABLE swarm_runs ADD COLUMN IF NOT EXISTS usage jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE swarm_runs ADD COLUMN IF NOT EXISTS budget_usd double precision;
+
 CREATE TABLE IF NOT EXISTS swarm_tasks (
-  run_id      text NOT NULL REFERENCES swarm_runs(run_id) ON DELETE CASCADE,
-  task_id     text NOT NULL,
-  seq         int NOT NULL DEFAULT 0,
-  payload     jsonb NOT NULL DEFAULT '{}'::jsonb,
-  status      text NOT NULL DEFAULT 'pending',
-  worker_id   int,
-  attempt     int NOT NULL DEFAULT 0,
-  last_error  text,
-  updated_at  timestamptz NOT NULL DEFAULT now(),
+  run_id        text NOT NULL REFERENCES swarm_runs(run_id) ON DELETE CASCADE,
+  task_id       text NOT NULL,
+  seq           int NOT NULL DEFAULT 0,
+  payload       jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status        text NOT NULL DEFAULT 'pending',
+  worker_id     int,
+  attempt       int NOT NULL DEFAULT 0,
+  failures      int NOT NULL DEFAULT 0,
+  input_tokens  bigint NOT NULL DEFAULT 0,
+  output_tokens bigint NOT NULL DEFAULT 0,
+  cost_usd      double precision NOT NULL DEFAULT 0,
+  last_error    text,
+  updated_at    timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (run_id, task_id)
 );
+
+ALTER TABLE swarm_tasks ADD COLUMN IF NOT EXISTS failures int NOT NULL DEFAULT 0;
+ALTER TABLE swarm_tasks ADD COLUMN IF NOT EXISTS input_tokens bigint NOT NULL DEFAULT 0;
+ALTER TABLE swarm_tasks ADD COLUMN IF NOT EXISTS output_tokens bigint NOT NULL DEFAULT 0;
+ALTER TABLE swarm_tasks ADD COLUMN IF NOT EXISTS cost_usd double precision NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_swarm_tasks_run_status ON swarm_tasks (run_id, status, seq);
 
@@ -65,7 +79,7 @@ CREATE TABLE IF NOT EXISTS swarm_broadcasts (
 );
 `;
 
-/** JSON text safe for jsonb: PostgreSQL rejects the \\u0000 escape. */
+/** JSON text safe for jsonb: PostgreSQL rejects the \u0000 escape. */
 export const pgJson = value => JSON.stringify(value).replace(/\\u0000/g, '');
 
 export function sanitizeSessionEntriesForResume(entries) {
@@ -105,24 +119,52 @@ export class RuntimeDb {
   }
 
   async migrate() {
-    await this.pool.query(SCHEMA_SQL);
+    const c = await this.pool.connect();
+    try {
+      await c.query('BEGIN');
+      await c.query('SELECT pg_advisory_xact_lock(781920451)');
+      await c.query(SCHEMA_SQL);
+      await c.query('COMMIT');
+    } catch (err) {
+      await c.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      c.release();
+    }
   }
 
-  async initRun({ runId, name, config, tasks, defaultGateLimit = 300, defaultPools = {} }) {
+  async initRun({
+    runId,
+    name,
+    config,
+    tasks,
+    defaultGateLimit = 300,
+    defaultPools = {},
+    defaultBudgetUsd = null,
+  }) {
     const c = await this.pool.connect();
     try {
       await c.query('BEGIN');
       const runRes = await c.query(
-        `INSERT INTO swarm_runs (run_id, name, config, gate_limit, pools)
-         VALUES ($1, $2, $3::jsonb, $4, $5::jsonb)
+        `INSERT INTO swarm_runs (run_id, name, config, gate_limit, pools, budget_usd)
+         VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6)
          ON CONFLICT (run_id) DO UPDATE SET
            name = EXCLUDED.name,
+           budget_usd = COALESCE($6, swarm_runs.budget_usd),
            heartbeat = now(),
            finished_at = NULL
-         RETURNING gate_limit, pools, metrics, started_at, timeline`,
-        [runId, name || runId, JSON.stringify(config || {}), defaultGateLimit, JSON.stringify(defaultPools)]
+         RETURNING gate_limit, pools, metrics, usage, budget_usd, started_at, timeline`,
+        [
+          runId,
+          name || runId,
+          pgJson(config || {}),
+          defaultGateLimit,
+          pgJson(defaultPools),
+          defaultBudgetUsd,
+        ]
       );
 
+      // Reset interrupted running/backoff tasks to pending; keep 'complete' and 'failed' untouched!
       await c.query(
         `UPDATE swarm_tasks
          SET status = 'pending', worker_id = NULL, updated_at = now()
@@ -136,7 +178,7 @@ export class RuntimeDb {
           const batch = tasks.slice(i, i + chunkSize);
           const ids = batch.map(t => String(t.id));
           const seqs = batch.map((_, idx) => i + idx);
-          const payloads = batch.map(t => JSON.stringify(t.payload ?? t));
+          const payloads = batch.map(t => pgJson(t.payload ?? t));
           await c.query(
             `INSERT INTO swarm_tasks (run_id, task_id, seq, payload, status)
              SELECT $1, u.task_id, u.seq, u.payload::jsonb, 'pending'
@@ -153,6 +195,8 @@ export class RuntimeDb {
         gateLimit: Number(row.gate_limit || defaultGateLimit),
         pools: row.pools || defaultPools,
         metrics: row.metrics || {},
+        usage: row.usage || {},
+        budgetUsd: row.budget_usd !== null && row.budget_usd !== undefined ? Number(row.budget_usd) : null,
         startedAt: row.started_at,
         timeline: Array.isArray(row.timeline) ? row.timeline : [],
       };
@@ -166,7 +210,7 @@ export class RuntimeDb {
 
   async loadTasks(runId) {
     const res = await this.pool.query(
-      `SELECT task_id AS id, payload, status, attempt, last_error
+      `SELECT task_id AS id, payload, status, attempt, failures, input_tokens, output_tokens, cost_usd, last_error
        FROM swarm_tasks
        WHERE run_id = $1
        ORDER BY seq ASC, task_id ASC`,
@@ -184,12 +228,53 @@ export class RuntimeDb {
     );
   }
 
-  async markTaskBackoff(runId, taskId, lastError) {
+  async markTaskBackoff(runId, taskId, failures, lastError) {
     await this.pool.query(
       `UPDATE swarm_tasks
-       SET status = 'backoff', worker_id = NULL, last_error = $3, updated_at = now()
+       SET status = 'backoff', worker_id = NULL, failures = $3, last_error = $4, updated_at = now()
        WHERE run_id = $1 AND task_id = $2`,
-      [runId, taskId, String(lastError || '').slice(0, 1000)]
+      [runId, taskId, failures, String(lastError || '').slice(0, 1000)]
+    );
+  }
+
+  async markTaskFailed(runId, taskId, failures, lastError) {
+    await this.pool.query(
+      `UPDATE swarm_tasks
+       SET status = 'failed', worker_id = NULL, failures = $3, last_error = $4, updated_at = now()
+       WHERE run_id = $1 AND task_id = $2`,
+      [runId, taskId, failures, String(lastError || '').slice(0, 1000)]
+    );
+  }
+
+  async retryFailedTasks(runId, taskIds = null) {
+    const filter = Array.isArray(taskIds) && taskIds.length > 0 ? taskIds.map(String) : null;
+    const res = filter
+      ? await this.pool.query(
+          `UPDATE swarm_tasks
+           SET status = 'pending', failures = 0, last_error = NULL, updated_at = now()
+           WHERE run_id = $1 AND task_id = ANY($2::text[]) AND status IN ('failed', 'backoff')
+           RETURNING task_id`,
+          [runId, filter]
+        )
+      : await this.pool.query(
+          `UPDATE swarm_tasks
+           SET status = 'pending', failures = 0, last_error = NULL, updated_at = now()
+           WHERE run_id = $1 AND status = 'failed'
+           RETURNING task_id`,
+          [runId]
+        );
+    return res.rows.map(r => r.task_id);
+  }
+
+  async addTaskUsage(runId, taskId, { inputTokens = 0, outputTokens = 0, costUsd = 0 }) {
+    await this.pool.query(
+      `UPDATE swarm_tasks
+       SET input_tokens = input_tokens + $3,
+           output_tokens = output_tokens + $4,
+           cost_usd = cost_usd + $5,
+           updated_at = now()
+       WHERE run_id = $1 AND task_id = $2`,
+      [runId, taskId, Math.round(inputTokens), Math.round(outputTokens), Number(costUsd) || 0]
     );
   }
 
@@ -213,6 +298,48 @@ export class RuntimeDb {
     } finally {
       c.release();
     }
+  }
+
+  async inspectTask(runId, taskId) {
+    const [taskRes, sessRes] = await Promise.all([
+      this.pool.query(
+        `SELECT task_id AS id, status, attempt, failures, worker_id, input_tokens, output_tokens, cost_usd, last_error, payload, updated_at
+         FROM swarm_tasks
+         WHERE run_id = $1 AND task_id = $2`,
+        [runId, String(taskId)]
+      ),
+      this.pool.query(
+        `SELECT entries, updated_at FROM swarm_sessions WHERE run_id = $1 AND task_id = $2`,
+        [runId, String(taskId)]
+      ),
+    ]);
+    if (!taskRes.rowCount) return null;
+    const t = taskRes.rows[0];
+    return {
+      ...t,
+      input_tokens: Number(t.input_tokens || 0),
+      output_tokens: Number(t.output_tokens || 0),
+      cost_usd: Number(t.cost_usd || 0),
+      sessionUpdatedAt: sessRes.rows[0]?.updated_at || null,
+      entries: sessRes.rows[0]?.entries || [],
+    };
+  }
+
+  async listTasksByStatus(runId, status, limit = 50) {
+    const res = await this.pool.query(
+      `SELECT task_id AS id, status, attempt, failures, worker_id, input_tokens, output_tokens, cost_usd, last_error, updated_at
+       FROM swarm_tasks
+       WHERE run_id = $1 AND ($2::text IS NULL OR status = $2)
+       ORDER BY updated_at DESC
+       LIMIT $3`,
+      [runId, status || null, Math.min(200, Math.max(1, Number(limit) || 50))]
+    );
+    return res.rows.map(r => ({
+      ...r,
+      input_tokens: Number(r.input_tokens || 0),
+      output_tokens: Number(r.output_tokens || 0),
+      cost_usd: Number(r.cost_usd || 0),
+    }));
   }
 
   async loadSession(runId, taskId) {
@@ -281,24 +408,31 @@ export class RuntimeDb {
     );
   }
 
-  async saveHeartbeat(runId, { gateLimit, pools, metrics, snapshot, timeline, finishedAt = null }) {
+  async saveHeartbeat(
+    runId,
+    { gateLimit, pools, metrics, usage, budgetUsd = null, snapshot, timeline, finishedAt = null }
+  ) {
     await this.pool.query(
       `UPDATE swarm_runs
        SET gate_limit = $2,
            pools = $3::jsonb,
            metrics = $4::jsonb,
-           snapshot = $5::jsonb,
-           timeline = COALESCE($6::jsonb, timeline),
+           usage = $5::jsonb,
+           budget_usd = $6,
+           snapshot = $7::jsonb,
+           timeline = COALESCE($8::jsonb, timeline),
            heartbeat = now(),
-           finished_at = COALESCE($7::timestamptz, finished_at)
+           finished_at = COALESCE($9::timestamptz, finished_at)
        WHERE run_id = $1`,
       [
         runId,
         gateLimit,
-        JSON.stringify(pools || {}),
-        JSON.stringify(metrics || {}),
-        JSON.stringify(snapshot || {}),
-        timeline ? JSON.stringify(timeline.slice(-720)) : null,
+        pgJson(pools || {}),
+        pgJson(metrics || {}),
+        pgJson(usage || {}),
+        budgetUsd,
+        pgJson(snapshot || {}),
+        timeline ? pgJson(timeline.slice(-720)) : null,
         finishedAt,
       ]
     );
@@ -306,7 +440,7 @@ export class RuntimeDb {
 
   async getRunDashboardState(runId) {
     const res = await this.pool.query(
-      `SELECT run_id, name, gate_limit, pools, metrics, snapshot, timeline, started_at, heartbeat, finished_at
+      `SELECT run_id, name, gate_limit, pools, metrics, usage, budget_usd, snapshot, timeline, started_at, heartbeat, finished_at
        FROM swarm_runs
        WHERE run_id = $1`,
       [runId]

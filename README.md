@@ -151,10 +151,27 @@ Without `progress()`, the bar falls back to task counts and ignores tasks that n
 ### CLI Operations
 
 ```bash
-pi-swarm run ./job.mjs --dashboard 3010
+# Sample 30 tasks first (retains transcripts & prints extrapolated full-run token/cost estimate)
+pi-swarm run ./job.mjs --sample 30
+
+# Start full run with $50 budget cap, webhook notifications, and live SSE dashboard
+pi-swarm run ./job.mjs --budget 50 --webhook https://hooks.slack.com/... --dashboard 3010
+
+# Inspect a live or failed session's conversation & tool-call transcript
+pi-swarm inspect --job ./job.mjs 0001
+
+# Pause, resume, or raise budget cap online without restarting
+pi-swarm pause  --job ./job.mjs "Investigating upstream spike"
+pi-swarm resume --job ./job.mjs
+pi-swarm budget --job ./job.mjs --usd 100
+
+# Re-queue tasks that reached maxFailures
+pi-swarm retry  --job ./job.mjs
+
+# Steer live sessions or hot-adjust AIMD/TPM/RPM limits
 pi-swarm steer --job ./job.mjs "Updated instruction for all active agents"
 pi-swarm steer --job ./job.mjs --interrupt "Abort slow turns and apply new rule immediately"
-pi-swarm limit --job ./job.mjs --pool gate --limit 1200 --max 1500
+pi-swarm limit --job ./job.mjs --pool gate --limit 1200 --max 1500 --tpm 2000000
 pi-swarm limit --job ./job.mjs --pool githubApi --limit 150 --rpm 4800
 pi-swarm status --job ./job.mjs
 ```

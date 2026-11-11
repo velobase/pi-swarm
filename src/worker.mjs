@@ -1,16 +1,16 @@
 /**
  * Swarm Worker process: task-agnostic host for up to N concurrent Pi AgentSessions.
  * Snapshots session state to PostgreSQL (`swarm_sessions`) after every turn,
- * resumes interrupted sessions seamlessly on restart, and exposes generic
- * `ctx.pool(name, fn)`, `ctx.cache`, and `ctx.metric(name, delta)` primitives to job tools.
+ * reports token usage & liveness activity, supports multi-endpoint/fallback routing,
+ * and exposes `ctx.pool(name, fn)`, `ctx.cache`, and `ctx.metric(name, delta)` primitives.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { pathToFileURL } from 'node:url';
 import {
   installGatedFetch,
   makeSlotClient,
-  createGcloudVertexAuth,
-  createStaticAuth,
+  EndpointRouter,
+  resolveAuthSpec,
 } from './gate.mjs';
 import { RuntimeDb } from './runtime-db.mjs';
 import { loadPiSdk, createJobModelRuntime } from './sdk-loader.mjs';
@@ -21,6 +21,7 @@ process.umask(0o077);
 const jobPath = process.env.PI_SWARM_JOB;
 const runtimeDbUrl = process.env.SWARM_DATABASE_URL;
 const shardIndex = Number(process.env.PI_SHARD || 0);
+const forceRetainSessions = process.env.PI_SWARM_RETAIN_SESSIONS === '1';
 
 if (!jobPath) throw new Error('Worker missing PI_SWARM_JOB');
 
@@ -28,7 +29,7 @@ const jobMod = await import(pathToFileURL(jobPath).href);
 const job = typeof jobMod.default === 'function' ? await jobMod.default() : jobMod.default;
 
 const local = new AsyncLocalStorage();
-const running = new Map();
+const running = new Map(); // taskId -> { session, sessionManager, task, abortedReason }
 let stopping = false;
 
 const send = data => {
@@ -42,31 +43,45 @@ const runtimeDb = new RuntimeDb(runtimeDbUrl || job.runtimeDatabaseUrl, {
 });
 
 const rawNativeFetch = globalThis.fetch;
-const auth =
-  job.model.auth === 'gcloud-vertex'
-    ? createGcloudVertexAuth({ nativeFetch: rawNativeFetch })
-    : typeof job.model.auth === 'object' && job.model.auth
-      ? job.model.auth
-      : job.model.apiKey
-        ? createStaticAuth(job.model.apiKey)
-        : null;
+const primaryBaseUrl =
+  job.model.baseUrl ||
+  (job.model.vertexProject
+    ? `https://aiplatform.googleapis.com/v1/projects/${job.model.vertexProject}/locations/${job.model.vertexLocation || 'global'}/endpoints/openapi`
+    : null);
+
+const router =
+  Array.isArray(job.model.endpoints) && job.model.endpoints.length > 0
+    ? new EndpointRouter(job.model.endpoints, { nativeFetch: rawNativeFetch })
+    : null;
+
+const auth = resolveAuthSpec(job.model.auth || job.model.apiKey, { nativeFetch: rawNativeFetch });
 
 const matchUrl =
   job.model.matchUrl ||
-  (job.model.baseUrl
-    ? new URL(job.model.baseUrl).hostname
-    : job.model.vertexProject
-      ? 'aiplatform.googleapis.com'
-      : null);
+  (primaryBaseUrl
+    ? url => {
+        try {
+          const u = new URL(url);
+          const p = new URL(primaryBaseUrl);
+          return u.host === p.host && u.pathname.startsWith(p.pathname.replace(/\/+$/, ''));
+        } catch {
+          return false;
+        }
+      }
+    : null);
 
 const nativeFetch = installGatedFetch({
   send,
   matchUrl,
+  primaryBaseUrl,
   auth,
+  router,
   getTaskContext: () => local.getStore(),
   onEvent: e => {
     const task = local.getStore();
-    if (task && e.type === 'llm_status') event(task, 'http_headers', { status: e.status });
+    if (task && e.type === 'llm_status') {
+      event(task, 'http_headers', { status: e.status, endpoint: e.endpoint });
+    }
   },
 });
 
@@ -180,34 +195,36 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
         ? SessionManager.inMemory(job.cwd, {}, savedEntries)
         : SessionManager.inMemory(job.cwd);
     } catch {
-      // A checkpoint that cannot be restored must never block the task: start fresh.
       isResumingSafe = false;
       manager = SessionManager.inMemory(job.cwd);
     }
 
     const sysPrompt =
-      typeof job.systemPrompt === 'function' ? await job.systemPrompt(task, sharedCtx) : job.systemPrompt;
+      typeof job.systemPrompt === 'function'
+        ? await job.systemPrompt(task, sharedCtx)
+        : job.systemPrompt;
 
-    const buildSession = mgr => createAgentSession({
-      cwd: job.cwd,
-      agentDir,
-      modelRuntime,
-      model,
-      sessionManager: mgr,
-      settingsManager: SettingsManager.inMemory({
-        httpIdleTimeoutMs: job.httpIdleTimeoutMs ?? 30 * 60_000,
-        compaction: job.compaction ?? {
-          enabled: true,
-          reserveTokens: 20_000,
-          keepRecentTokens: 25_000,
-        },
-        retry: job.retry,
-        cacheWarming: 'off',
-      }),
-      resourceLoader: makeResourceLoader(sysPrompt),
-      tools: customTools.map(t => t.name),
-      customTools,
-    });
+    const buildSession = mgr =>
+      createAgentSession({
+        cwd: job.cwd,
+        agentDir,
+        modelRuntime,
+        model,
+        sessionManager: mgr,
+        settingsManager: SettingsManager.inMemory({
+          httpIdleTimeoutMs: job.httpIdleTimeoutMs ?? 30 * 60_000,
+          compaction: job.compaction ?? {
+            enabled: true,
+            reserveTokens: 20_000,
+            keepRecentTokens: 25_000,
+          },
+          retry: job.retry,
+          cacheWarming: 'off',
+        }),
+        resourceLoader: makeResourceLoader(sysPrompt),
+        tools: customTools.map(t => t.name),
+        customTools,
+      });
 
     let created;
     try {
@@ -220,7 +237,8 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
     }
 
     session = created.session;
-    running.set(id, { session, sessionManager: manager, task });
+    const entryObj = { session, sessionManager: manager, task, abortedReason: null };
+    running.set(id, entryObj);
     event(id, 'session_ready', { model: session.model?.id, resumed: isResumingSafe });
 
     session.subscribe(e => {
@@ -239,6 +257,15 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
         });
       } else if (e.type === 'message_end') {
         void queueCheckpoint();
+        if (e.message?.role === 'assistant' && e.message?.usage) {
+          const u = e.message.usage;
+          event(id, 'usage', {
+            input: Number(u.input || u.prompt_tokens || 0),
+            output: Number(u.output || u.completion_tokens || 0),
+            cacheRead: Number(u.cacheRead || 0),
+            cacheWrite: Number(u.cacheWrite || 0),
+          });
+        }
       } else if (e.type === 'message_start' && e.message.role === 'user') {
         const text = JSON.stringify(e.message.content || '');
         const matches = [...text.matchAll(/\[BROADCAST:([A-Za-z0-9_-]+)\]/g)];
@@ -264,10 +291,15 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
     let continuations = 0;
     const maxContinuations = job.maxContinuations ?? 5;
     let last = session.messages.filter(m => m.role === 'assistant').at(-1);
-    while (last?.stopReason === 'error' && continuations < maxContinuations && !stopping) {
+    while (
+      last?.stopReason === 'error' &&
+      continuations < maxContinuations &&
+      !stopping &&
+      !entryObj.abortedReason
+    ) {
       continuations++;
-      await new Promise(r => setTimeout(r, 10_000 * continuations));
-      if (stopping) break;
+      await new Promise(r => setTimeout(r, Math.min(30_000, 2000 * continuations)));
+      if (stopping || entryObj.abortedReason) break;
       event(id, 'continuation', { continuations, error: last.errorMessage });
       await local.run(id, () =>
         session.prompt(
@@ -284,10 +316,15 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
       return;
     }
 
+    const finalError =
+      entryObj.abortedReason ||
+      (last?.stopReason === 'error' ? last?.errorMessage || 'assistant_stop_error' : undefined);
+
     event(id, 'run_finished', {
-      error: last?.stopReason === 'error' ? last?.errorMessage : undefined,
-      stopReason: last?.stopReason,
+      error: finalError,
+      stopReason: entryObj.abortedReason ? 'stalled' : last?.stopReason,
       continuations,
+      retainSession: forceRetainSessions,
     });
   } catch (err) {
     await checkpointChain;
@@ -298,6 +335,17 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
     running.delete(id);
     session?.dispose();
   }
+}
+
+async function handleAbortTask({ taskId, reason }) {
+  const entry = running.get(String(taskId));
+  if (!entry) return;
+  entry.abortedReason = reason || 'stalled_task_aborted';
+  try {
+    await entry.session.abort();
+    const snap = serializeSessionManager(entry.sessionManager);
+    await runtimeDb.saveSession(job.runId, String(taskId), snap);
+  } catch {}
 }
 
 async function handleSteer(msg) {
@@ -372,6 +420,10 @@ async function stop() {
 process.on('message', message => {
   if (message.type === 'start' && !stopping) {
     void runTask(message.task, message.attempt, message.broadcasts || []);
+  } else if (message.type === 'abort_task' && !stopping) {
+    void handleAbortTask(message);
+  } else if (message.type === 'router_stats_req') {
+    send({ type: 'router_stats', shard: shardIndex, endpoints: router ? router.snapshot() : [] });
   } else if (message.type === 'steer' && !stopping) {
     void handleSteer(message);
   } else if (message.type === 'stop') {

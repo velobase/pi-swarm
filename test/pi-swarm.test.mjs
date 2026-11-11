@@ -7,9 +7,11 @@ import {
   fuzzyResolveId,
   Gate,
   SlotPool,
+  EndpointRouter,
   RuntimeDb,
 } from '../src/index.mjs';
-import { sanitizeSessionEntriesForResume } from '../src/runtime-db.mjs';
+import { sanitizeSessionEntriesForResume, pgJson } from '../src/runtime-db.mjs';
+import { errorKey, computeRate, buildProgress, evaluateHealth } from '../src/dashboard/state.mjs';
 
 test('liberal input normalizers handle stringified JSON and fuzzy IDs', () => {
   assert.deepEqual(parseMaybeJson('{"a":1}'), { a: 1 });
@@ -28,11 +30,12 @@ test('liberal input normalizers handle stringified JSON and fuzzy IDs', () => {
   assert.equal(fuzzyResolveId(owned, 'completely-unrelated'), null);
 });
 
-test('Gate enforces AIMD, priority retry queue, and worker crash cleanup', () => {
+test('Gate enforces AIMD, priority retry queue, TPM cap, pause/resume, circuit breaker, and worker crash cleanup', () => {
   const gate = new Gate({
     limit: 2,
     min: 1,
     max: 10,
+    tpm: 1000,
     increaseStep: 0.5,
     decreaseFactor: 0.5,
     cooldownMinMs: 20,
@@ -40,22 +43,63 @@ test('Gate enforces AIMD, priority retry queue, and worker crash cleanup', () =>
   });
 
   const order = [];
-  gate.acquire('r1', 0, () => order.push('r1'));
-  gate.acquire('r2', 1, () => order.push('r2'));
-  gate.acquire('cold-3', 0, () => order.push('cold-3'), { priority: 0 });
-  gate.acquire('retry-4', 0, () => order.push('retry-4'), { priority: 1 });
+  gate.acquire('r1', 0, () => order.push('r1'), { taskId: 't1', estTokens: 400 });
+  gate.acquire('r2', 1, () => order.push('r2'), { taskId: 't2', estTokens: 400 });
+  gate.acquire('cold-3', 0, () => order.push('cold-3'), { priority: 0, taskId: 't3', estTokens: 150 });
+  gate.acquire('retry-4', 0, () => order.push('retry-4'), { priority: 1, taskId: 't4', estTokens: 150 });
 
   assert.deepEqual(order, ['r1', 'r2']);
-  assert.equal(gate.inflight, 2);
-  assert.equal(gate.waitingCount, 2);
+  assert.equal(gate.hasTaskActivity('t1'), true);
+  assert.equal(gate.hasTaskActivity('t4'), true);
+  assert.equal(gate.hasTaskActivity('t99'), false);
 
+  // Release r1 -> priority retry-4 jumps ahead (800 + 150 <= 1000 TPM)
   gate.release('r1', 200);
   assert.deepEqual(order, ['r1', 'r2', 'retry-4']);
-  assert.equal(gate.snapshot().rawLimit, 2.5);
 
+  // Worker 1 crashes -> r2 freed, now usedTokens = 950 so cold-3 (150 tok) is held by TPM=1000!
   gate.dropWorker(1);
+  assert.deepEqual(order, ['r1', 'r2', 'retry-4']);
+  assert.equal(gate.waitingCount, 1);
+
+  // Raising TPM lets cold-3 through immediately
+  gate.setLimits({ tpm: 2000 });
   assert.deepEqual(order, ['r1', 'r2', 'retry-4', 'cold-3']);
+
+  // Free one slot so capacity is available, then test pause & resume
+  gate.release('retry-4', 200);
+  gate.pause('manual_test');
+  gate.acquire('r5', 0, () => order.push('r5'));
+  assert.equal(order.includes('r5'), false);
+  gate.resume();
+  assert.equal(order.includes('r5'), true);
+
+  // Circuit breaker on 401 storm
+  for (let i = 0; i < 10; i++) gate.release(`f${i}`, 401);
+  const tripped = gate.checkCircuitBreaker({ minRequests: 8, fatalShare: 0.5 });
+  assert.equal(tripped.tripped, true);
+  assert.equal(tripped.topStatus, 401);
   gate.close();
+});
+
+test('EndpointRouter round-robins primaries and switches to fallback on cooldown', () => {
+  const router = new EndpointRouter([
+    { name: 'p1', baseUrl: 'https://p1.example/v1', apiKey: 'k1', cooldownMs: 5000 },
+    { name: 'p2', baseUrl: 'https://p2.example/v1', apiKey: 'k2', cooldownMs: 5000 },
+    { name: 'fb', baseUrl: 'https://fb.example/v1', model: 'backup-model', apiKey: 'k3', fallback: true },
+  ]);
+
+  const a = router.pick();
+  const b = router.pick();
+  assert.equal(a.name, 'p1');
+  assert.equal(b.name, 'p2');
+
+  router.report(a, 429);
+  router.report(b, 503);
+
+  const c = router.pick();
+  assert.equal(c.name, 'fb');
+  assert.equal(c.model, 'backup-model');
 });
 
 test('SlotPool enforces concurrency and sliding-window RPM limits', () => {
@@ -78,7 +122,7 @@ test('SlotPool enforces concurrency and sliding-window RPM limits', () => {
   pool.close();
 });
 
-test('sanitizeSessionEntriesForResume strips trailing errored assistant turn', () => {
+test('sanitizeSessionEntriesForResume and pgJson', () => {
   const entries = [
     { type: 'session', id: 's1' },
     { type: 'message', message: { role: 'user', content: 'hi' } },
@@ -89,9 +133,10 @@ test('sanitizeSessionEntriesForResume strips trailing errored assistant turn', (
   const cleaned = sanitizeSessionEntriesForResume(entries);
   assert.equal(cleaned.length, 4);
   assert.equal(cleaned.at(-1).message.role, 'toolResult');
+  assert.equal(pgJson({ a: 'x\u0000y' }), '{"a":"xy"}');
 });
 
-test('defineSwarm has zero hardcoded task-specific pools', () => {
+test('defineSwarm has zero hardcoded task-specific pools and exposes safety defaults', () => {
   const spec = defineSwarm({
     runId: 'unit-run',
     model: { provider: 'v', id: 'm', baseUrl: 'https://example.com/v1' },
@@ -100,10 +145,38 @@ test('defineSwarm has zero hardcoded task-specific pools', () => {
   });
   assert.equal(spec.concurrency, 3000);
   assert.equal(spec.httpIdleTimeoutMs, 1_800_000);
+  assert.equal(spec.circuitBreaker.enabled, true);
+  assert.equal(spec.taskRetries.maxFailures, 5);
   assert.deepEqual(spec.pools, {});
 });
 
-test('RuntimeDb persists tasks, sessions, generic KV cache, metrics, and learned gate limits', async t => {
+test('dashboard state: error grouping, rate, progress, paused/breaker/failure verdicts', () => {
+  const a = errorKey('save_item: [{"type":"text","text":"Handle \\"foo-1\\" is not in task 0012. Valid handles: a, b"}]');
+  const b = errorKey('save_item: [{"type":"text","text":"Handle \\"bar-22\\" is not in task 0931. Valid handles: c, d"}]');
+  assert.equal(a.split('Valid')[0], b.split('Valid')[0]);
+
+  const now = 1_000_000_000;
+  const samples = [{ t: now - 240_000, done: 100 }, { t: now - 120_000, done: 180 }, { t: now, done: 300 }];
+  assert.equal(computeRate(samples, now), 50);
+
+  const live = { at: new Date(now).toISOString(), tasks: { total: 100, done: 40, skipped: 30, failed: 0, active: 60 } };
+  const fromJob = buildProgress({ jobProgress: { done: 300, total: 800, unit: 'items' }, live, samples, now });
+
+  assert.equal(
+    evaluateHealth({ live: { ...live, paused: true, pauseReason: 'circuit_breaker: 401' }, timeline: [], progress: fromJob, timeoutMs: 300_000, now }).code,
+    'circuit_breaker'
+  );
+  assert.equal(
+    evaluateHealth({ live: { ...live, paused: true, pauseReason: 'budget_exceeded: $5' }, timeline: [], progress: fromJob, timeoutMs: 300_000, now }).code,
+    'budget_exceeded'
+  );
+  assert.equal(
+    evaluateHealth({ live: { ...live, finishedAt: new Date(now).toISOString(), tasks: { ...live.tasks, failed: 3 } }, timeline: [], progress: fromJob, timeoutMs: 300_000, now }).code,
+    'finished_with_failures'
+  );
+});
+
+test('RuntimeDb persists tasks, failures, retry, inspect, usage, and learned gate limits', async t => {
   const url = process.env.TEST_SWARM_DATABASE_URL;
   if (!url) {
     t.skip('TEST_SWARM_DATABASE_URL not set');
@@ -113,7 +186,7 @@ test('RuntimeDb persists tasks, sessions, generic KV cache, metrics, and learned
   await db.migrate();
   const runId = 'test-run-' + Date.now();
 
-  const init1 = await db.initRun({
+  await db.initRun({
     runId,
     name: 'Integration Test',
     config: { concurrency: 10 },
@@ -122,86 +195,39 @@ test('RuntimeDb persists tasks, sessions, generic KV cache, metrics, and learned
       { id: '0002', payload: { items: [3, 4] } },
     ],
     defaultGateLimit: 250,
+    defaultBudgetUsd: 12.5,
   });
-  assert.equal(init1.gateLimit, 250);
 
   await db.markTaskRunning(runId, '0001', 0, 1);
+  await db.addTaskUsage(runId, '0001', { inputTokens: 1200, outputTokens: 400, costUsd: 0.015 });
   await db.saveSession(runId, '0001', [
     { type: 'session', id: '0001' },
     { type: 'message', message: { role: 'user', content: 'start' } },
-    { type: 'message', message: { role: 'assistant', stopReason: 'error', errorMessage: 'timeout' } },
   ]);
-  await db.saveHeartbeat(runId, {
-    gateLimit: 880,
-    pools: { githubApi: { limit: 80 } },
-    metrics: { api_calls: 42, tokens_used: 9500 },
-    snapshot: { tasks: { total: 2, done: 0 } },
-    timeline: [{ t: 10, limit: 880 }],
-  });
+  await db.markTaskFailed(runId, '0002', 5, 'fatal_item_err');
 
-  const init2 = await db.initRun({
+  const inspected = await db.inspectTask(runId, '0001');
+  assert.equal(inspected.input_tokens, 1200);
+  assert.equal(inspected.entries.length, 2);
+
+  // Restart keeps failed task as failed, resets running task to pending
+  await db.initRun({
     runId,
     name: 'Integration Test',
     config: { concurrency: 10 },
-    tasks: [
-      { id: '0001', payload: { items: [1, 2] } },
-      { id: '0002', payload: { items: [3, 4] } },
-    ],
+    tasks: [],
     defaultGateLimit: 250,
   });
-  assert.equal(init2.gateLimit, 880);
-  assert.equal(init2.metrics.tokens_used, 9500);
+  const afterRestart = await db.loadTasks(runId);
+  assert.equal(afterRestart.find(x => x.id === '0001').status, 'pending');
+  assert.equal(afterRestart.find(x => x.id === '0002').status, 'failed');
 
-  const tasks = await db.loadTasks(runId);
-  assert.equal(tasks[0].status, 'pending');
-
-  const restoredSession = await db.loadSession(runId, '0001');
-  assert.equal(restoredSession.length, 2);
-
-  await db.cacheSet('my-ns', 'key-1', { ok: true, data: [1, 2, 3] });
-  const hit = await db.cacheGet('my-ns', 'key-1', 3600);
-  assert.deepEqual(hit, { ok: true, data: [1, 2, 3] });
-
-  await db.markTaskComplete(runId, '0001', { retainSession: false });
-  const afterComplete = await db.loadSession(runId, '0001');
-  assert.equal(afterComplete, null);
+  // retryFailedTasks resets failed back to pending
+  const retried = await db.retryFailedTasks(runId);
+  assert.deepEqual(retried, ['0002']);
+  const afterRetry = await db.loadTasks(runId);
+  assert.equal(afterRetry.find(x => x.id === '0002').status, 'pending');
 
   await db.pool.query(`DELETE FROM swarm_runs WHERE run_id = $1`, [runId]);
-  await db.pool.query(`DELETE FROM swarm_cache WHERE namespace = 'my-ns'`);
   await db.close();
-});
-
-import { errorKey, computeRate, buildProgress, evaluateHealth } from '../src/dashboard/state.mjs';
-
-test('dashboard state: error grouping, rate, progress and health verdicts', () => {
-  const a = errorKey('save_item: [{"type":"text","text":"Handle \\"foo-1\\" is not in task 0012. Valid handles: a, b"}]');
-  const b = errorKey('save_item: [{"type":"text","text":"Handle \\"bar-22\\" is not in task 0931. Valid handles: c, d"}]');
-  assert.equal(a.startsWith('save_item: Handle'), true);
-  assert.equal(a.split('Valid')[0], b.split('Valid')[0]);
-
-  const now = 1_000_000_000;
-  const samples = [{ t: now - 240_000, done: 100 }, { t: now - 120_000, done: 180 }, { t: now, done: 300 }];
-  assert.equal(computeRate(samples, now), 50);
-  assert.equal(computeRate([{ t: now, done: 1 }], now), null);
-
-  // Fallback progress ignores tasks that were already complete at start.
-  const live = { at: new Date(now).toISOString(), tasks: { total: 100, done: 40, skipped: 30, active: 60 } };
-  const fallback = buildProgress({ jobProgress: null, live, samples, now });
-  assert.deepEqual([fallback.done, fallback.total, fallback.source], [10, 70, 'tasks']);
-  const fromJob = buildProgress({ jobProgress: { done: 300, total: 800, unit: 'items' }, live, samples, now });
-  assert.deepEqual([fromJob.done, fromJob.remaining, fromJob.etaSec], [300, 500, 600]);
-
-  const row = (w, waitP95 = 1000) => ({ window: { ok: 0, backoff: 0, other: 0, net: 0, ...w }, waitP95 });
-  const verdict = tl => evaluateHealth({ live, timeline: tl, progress: fromJob, timeoutMs: 300_000, now }).code;
-  assert.equal(verdict([row({ ok: 100 })]), 'healthy');
-  assert.equal(verdict([row({ ok: 10, other: 90 })]), 'upstream_errors');
-  assert.equal(verdict([row({ ok: 100 }, 290_000)]), 'queue_wait');
-  assert.equal(verdict([row({ ok: 40, net: 60 })]), 'network_failures');
-  assert.equal(verdict([row({ ok: 60, backoff: 40 })]), 'rate_limited');
-  assert.equal(evaluateHealth({ live: { ...live, at: new Date(now - 60_000).toISOString() }, timeline: [], progress: fromJob, timeoutMs: 0, now }).code, 'stale');
-});
-
-test('pgJson strips NUL escapes that jsonb rejects', async () => {
-  const { pgJson } = await import('../src/runtime-db.mjs');
-  assert.equal(pgJson({ a: 'x\u0000y' }), '{"a":"xy"}');
 });

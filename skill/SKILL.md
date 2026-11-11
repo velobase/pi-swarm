@@ -83,17 +83,32 @@ Each of these cost real time once. The scheduler now handles the ones marked "bu
 2. Destructive actions are soft and record a reason.
 3. `gate.min`, `gate.limit` and each pool's caps are set from evidence, not guesses.
 4. `progress()` returns your real done and total.
-5. Run a small slice first: `pi-swarm run ./job.mjs --only-tasks 0001,0002,0003`. Read what was written. Check the share of destructive actions. A wrong rule found on thirty items is a note; found on thirty thousand it is a rollback.
+5. Run a sample first: `pi-swarm run ./job.mjs --sample 30`. Sample mode spreads 30 tasks across the catalog, keeps their session transcripts for `pi-swarm inspect`, and prints extrapolated full-run tokens, USD cost and action metrics. Read what was written and check the share of destructive actions before launching the full run.
+
+## Built-in safety nets (v0.2+)
+
+- **Circuit breaker** (`circuitBreaker: { enabled: true, minRequests: 20, fatalShare: 0.5 }`): automatically pauses both dispatch and queued gate requests when non-retryable 4xx errors (400/401/403/404/422) dominate the last 60s, preventing auth storms from burning quota. Fix the issue and run `pi-swarm resume`.
+- **Bounded task failures** (`taskRetries: { maxFailures: 5 }`): poison tasks exit as `failed` (preserving their session checkpoint for `pi-swarm inspect`) instead of blocking completion forever. Re-queue them later with `pi-swarm retry`.
+- **Demand-driven session admission** (`sessionAdmission: { perGateSlot: 3, minActive: 100 }`): spawns active sessions proportional to `gate.limit` rather than allocating 3,000 idle sessions in second 1, keeping memory lean and queue waits low.
+- **Token & budget accounting** (`model.cost`, `budgetUsd`, `gate.tpm`): tracks per-task and run-wide tokens/USD cost, enforces optional rolling TPM caps, and auto-pauses when `costUsd >= budgetUsd` (raise online via `pi-swarm budget --usd N`).
+- **Multi-endpoint & fallback routing** (`model.endpoints`): round-robins across multiple endpoints/API keys with per-endpoint cooldown on 429/5xx, failing over to `fallback: true` endpoints/models automatically.
+- **Stuck-session recovery** (`stallTimeoutMs: 600_000`): aborts and retries sessions that make zero tool or gate progress past the timeout without falsely killing sessions waiting in the LLM queue.
+- **Webhook alerts** (`webhookUrl` / `--webhook`): posts Slack/Lark/Discord-compatible JSON notifications on circuit breaker trips, budget pauses and run completion.
 
 ## While it runs
 
 ```bash
-pi-swarm status --job ./job.mjs
-pi-swarm limit  --job ./job.mjs --pool gate --min 300 --limit 600
-pi-swarm limit  --job ./job.mjs --pool reader --limit 300 --rpm 480
-pi-swarm steer  --job ./job.mjs "New rule for all sessions: ..."
-pi-swarm steer  --job ./job.mjs --interrupt "Stop the current turn and apply: ..."
-pi-swarm stop   --job ./job.mjs
+pi-swarm status  --job ./job.mjs
+pi-swarm inspect --job ./job.mjs 0001
+pi-swarm pause   --job ./job.mjs "Checking sample output"
+pi-swarm resume  --job ./job.mjs
+pi-swarm retry   --job ./job.mjs
+pi-swarm budget  --job ./job.mjs --usd 100
+pi-swarm limit   --job ./job.mjs --pool gate --min 300 --limit 600 --tpm 2000000
+pi-swarm limit   --job ./job.mjs --pool reader --limit 300 --rpm 480
+pi-swarm steer   --job ./job.mjs "New rule for all sessions: ..."
+pi-swarm steer   --job ./job.mjs --interrupt "Stop the current turn and apply: ..."
+pi-swarm stop    --job ./job.mjs
 ```
 
 Changing limits and steering never need a restart. A restart is safe: sessions resume from their checkpoints and finished items are skipped.

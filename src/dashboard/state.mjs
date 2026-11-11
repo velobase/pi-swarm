@@ -72,7 +72,22 @@ export function buildProgress({ jobProgress, live, samples, now = Date.now() }) 
 export function evaluateHealth({ live, timeline = [], progress, timeoutMs, alerts = {}, now = Date.now() }) {
   const a = { ...DEFAULT_ALERTS, ...alerts };
   if (!live || !live.tasks) return { level: 'idle', code: 'idle', params: {} };
-  if (live.finishedAt) return { level: 'done', code: 'finished', params: {} };
+  if (live.finishedAt) {
+    const failed = Number(live.tasks.failed) || 0;
+    if (failed > 0) {
+      return { level: 'warn', code: 'finished_with_failures', params: { failed, done: live.tasks.done } };
+    }
+    return { level: 'done', code: 'finished', params: {} };
+  }
+  if (live.paused) {
+    const reason = String(live.pauseReason || 'manual');
+    const isBreaker = reason.startsWith('circuit_breaker');
+    return {
+      level: isBreaker ? 'crit' : 'warn',
+      code: isBreaker ? 'circuit_breaker' : reason.startsWith('budget_exceeded') ? 'budget_exceeded' : 'paused',
+      params: { reason },
+    };
+  }
 
   const ageSec = Math.round((now - Date.parse(live.at)) / 1000);
   if (ageSec > a.staleSec) return { level: 'crit', code: 'stale', params: { ageSec } };

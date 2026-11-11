@@ -1,17 +1,18 @@
 /**
- * Global AIMD LLM concurrency gate (with priority retry queue & worker leak protection),
- * bounded external tool SlotPool (concurrency + sliding-window RPM),
- * and transparent token refresh on HTTP 401.
+ * Global AIMD LLM concurrency + TPM gate, priority retry queue, pause/circuit-breaker support,
+ * multi-endpoint / fallback model router, and bounded external tool SlotPool.
  */
 import { execFile } from 'node:child_process';
 
 const DEFAULT_BACKOFF_STATUSES = new Set([429, 503, 529]);
+const BREAKER_FATAL_STATUSES = new Set([400, 401, 403, 404, 422]);
 
 export class Gate {
   constructor({
     limit = 300,
     min = 50,
     max = 1500,
+    tpm = 0,
     increaseStep = 0.1,
     decreaseFactor = 0.7,
     cooldownMinMs = 2000,
@@ -21,17 +22,22 @@ export class Gate {
       limit,
       min,
       max,
+      tpm,
       increaseStep,
       decreaseFactor,
       cooldownMinMs,
       cooldownJitterMs,
     });
-    this.held = new Map(); // grantId -> workerIndex
-    this.highQueue = [];   // retried / priority requests (jump ahead of cold requests)
-    this.normalQueue = []; // first-attempt requests
+    this.held = new Map(); // grantId -> { workerIndex, taskId }
+    this.highQueue = [];   // { id, workerIndex, taskId, estTokens, grant }
+    this.normalQueue = [];
     this.cooldownUntil = 0;
     this.lastDecreaseAt = 0;
+    this.paused = false;
+    this.pauseReason = null;
     this.timer = null;
+    this.tokenEvents = []; // { at, tokens }
+    this.recentOutcomes = []; // { at, status }
     this.window = { ok: 0, backoff: 0, other: 0, net: 0 };
     this.total = { ok: 0, backoff: 0, other: 0, net: 0, granted: 0 };
   }
@@ -44,27 +50,86 @@ export class Gate {
     return this.highQueue.length + this.normalQueue.length;
   }
 
-  acquire(id, workerIndex, grant, { priority = 0 } = {}) {
-    const entry = { id, workerIndex, grant };
+  pause(reason = 'manual') {
+    this.paused = true;
+    this.pauseReason = String(reason);
+  }
+
+  resume() {
+    this.paused = false;
+    this.pauseReason = null;
+    this.recentOutcomes.length = 0;
+    this.pump();
+  }
+
+  pruneRolling(now = Date.now()) {
+    while (this.tokenEvents.length && now - this.tokenEvents[0].at >= 60_000) {
+      this.tokenEvents.shift();
+    }
+    while (this.recentOutcomes.length && now - this.recentOutcomes[0].at >= 60_000) {
+      this.recentOutcomes.shift();
+    }
+  }
+
+  tokensLastMinute(now = Date.now()) {
+    this.pruneRolling(now);
+    let sum = 0;
+    for (const e of this.tokenEvents) sum += e.tokens;
+    return sum;
+  }
+
+  recordTokens(tokens) {
+    const n = Number(tokens) || 0;
+    if (n > 0) this.tokenEvents.push({ at: Date.now(), tokens: n });
+  }
+
+  hasTaskActivity(taskId) {
+    if (!taskId) return false;
+    for (const v of this.held.values()) if (v.taskId === taskId) return true;
+    for (const w of this.highQueue) if (w.taskId === taskId) return true;
+    for (const w of this.normalQueue) if (w.taskId === taskId) return true;
+    return false;
+  }
+
+  acquire(id, workerIndex, grant, { priority = 0, taskId = null, estTokens = 0 } = {}) {
+    const entry = { id, workerIndex, taskId, estTokens: Math.max(0, Number(estTokens) || 0), grant };
     if (priority > 0) this.highQueue.push(entry);
     else this.normalQueue.push(entry);
     this.pump();
   }
 
+  scheduleTimer(ms) {
+    if (this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.pump();
+    }, Math.max(10, ms));
+  }
+
   pump() {
+    if (this.paused) return;
     const now = Date.now();
     if (now < this.cooldownUntil) {
-      if (!this.timer) {
-        this.timer = setTimeout(() => {
-          this.timer = null;
-          this.pump();
-        }, Math.max(5, this.cooldownUntil - now));
-      }
+      this.scheduleTimer(this.cooldownUntil - now);
       return;
     }
+
+    let usedTokens = this.tpm > 0 ? this.tokensLastMinute(now) : 0;
+
     while (this.held.size < Math.floor(this.limit) && (this.highQueue.length || this.normalQueue.length)) {
+      const peek = this.highQueue.length ? this.highQueue[0] : this.normalQueue[0];
+      if (this.tpm > 0 && usedTokens > 0 && usedTokens + peek.estTokens > this.tpm) {
+        const oldest = this.tokenEvents[0];
+        const waitMs = oldest ? 60_000 - (now - oldest.at) + 10 : 250;
+        this.scheduleTimer(waitMs);
+        return;
+      }
       const next = this.highQueue.length ? this.highQueue.shift() : this.normalQueue.shift();
-      this.held.set(next.id, next.workerIndex);
+      this.held.set(next.id, { workerIndex: next.workerIndex, taskId: next.taskId });
+      if (next.estTokens > 0) {
+        this.tokenEvents.push({ at: now, tokens: next.estTokens });
+        usedTokens += next.estTokens;
+      }
       this.total.granted++;
       next.grant();
     }
@@ -73,6 +138,9 @@ export class Gate {
   release(id, status) {
     this.held.delete(id);
     const now = Date.now();
+    this.recentOutcomes.push({ at: now, status });
+    this.pruneRolling(now);
+
     if (DEFAULT_BACKOFF_STATUSES.has(status)) {
       this.window.backoff++;
       this.total.backoff++;
@@ -98,34 +166,72 @@ export class Gate {
     this.pump();
   }
 
+  /**
+   * Checks whether non-retryable 4xx (e.g. 401/403/400) in the rolling 60s window
+   * exceed the circuit-breaker threshold.
+   */
+  checkCircuitBreaker({ minRequests = 20, fatalShare = 0.5 } = {}) {
+    const now = Date.now();
+    this.pruneRolling(now);
+    const total = this.recentOutcomes.length;
+    if (total < minRequests) return null;
+    let fatal = 0;
+    const byStatus = {};
+    for (const o of this.recentOutcomes) {
+      if (BREAKER_FATAL_STATUSES.has(o.status)) {
+        fatal++;
+        byStatus[o.status] = (byStatus[o.status] || 0) + 1;
+      }
+    }
+    const share = fatal / total;
+    if (share >= fatalShare) {
+      const topStatus = Object.entries(byStatus).sort((a, b) => b[1] - a[1])[0]?.[0] || '4xx';
+      return {
+        tripped: true,
+        share,
+        fatal,
+        total,
+        topStatus: Number(topStatus) || topStatus,
+        reason: `circuit_breaker: ${fatal}/${total} requests failed with HTTP ${topStatus} in last 60s`,
+      };
+    }
+    return null;
+  }
+
   dropWorker(workerIndex) {
     this.highQueue = this.highQueue.filter(w => w.workerIndex !== workerIndex);
     this.normalQueue = this.normalQueue.filter(w => w.workerIndex !== workerIndex);
-    for (const [id, wi] of this.held) {
-      if (wi === workerIndex) this.held.delete(id);
+    for (const [id, v] of this.held) {
+      if (v.workerIndex === workerIndex) this.held.delete(id);
     }
     this.pump();
   }
 
-  setLimits({ limit, min, max } = {}) {
+  setLimits({ limit, min, max, tpm } = {}) {
     if (Number.isFinite(min) && min > 0) this.min = min;
     if (Number.isFinite(max) && max >= this.min) this.max = max;
     if (Number.isFinite(limit) && limit > 0) {
       this.limit = Math.min(this.max, Math.max(this.min, limit));
     }
+    if (Number.isFinite(tpm) && tpm >= 0) this.tpm = tpm;
     this.pump();
   }
 
   snapshot(resetWindow = false) {
+    const now = Date.now();
     const s = {
       limit: Math.floor(this.limit),
       rawLimit: Number(this.limit.toFixed(2)),
       min: this.min,
       max: this.max,
+      tpm: this.tpm,
+      tokensLastMinute: this.tokensLastMinute(now),
+      paused: this.paused,
+      pauseReason: this.pauseReason,
       inflight: this.held.size,
       waiting: this.waitingCount,
       priorityWaiting: this.highQueue.length,
-      coolingMs: Math.max(0, Math.round(this.cooldownUntil - Date.now())),
+      coolingMs: Math.max(0, Math.round(this.cooldownUntil - now)),
       window: { ...this.window },
       total: { ...this.total },
     };
@@ -265,16 +371,112 @@ export function createGcloudVertexAuth({ nativeFetch = globalThis.fetch } = {}) 
   };
 }
 
+export function resolveAuthSpec(spec, { nativeFetch = globalThis.fetch } = {}) {
+  if (!spec) return null;
+  if (spec === 'gcloud-vertex') return createGcloudVertexAuth({ nativeFetch });
+  if (typeof spec === 'object' && typeof spec.getToken === 'function') return spec;
+  if (typeof spec === 'string') return createStaticAuth(spec);
+  return null;
+}
+
+/**
+ * Round-robin + cooldown router across multiple endpoints / API keys + optional fallback model.
+ * Each endpoint: { name?, baseUrl, model?, auth?|apiKey?, fallback?: boolean, cooldownMs?: number }
+ */
+export class EndpointRouter {
+  constructor(endpoints = [], { nativeFetch = globalThis.fetch } = {}) {
+    this.rr = 0;
+    this.endpoints = endpoints.map((ep, idx) => ({
+      name: ep.name || (ep.fallback ? `fallback-${idx}` : `ep-${idx}`),
+      baseUrl: String(ep.baseUrl || '').replace(/\/+$/, ''),
+      model: ep.model || null,
+      fallback: Boolean(ep.fallback),
+      cooldownMs: Number(ep.cooldownMs || 10_000),
+      auth: resolveAuthSpec(ep.auth || ep.apiKey, { nativeFetch }),
+      cooldownUntil: 0,
+      stats: { ok: 0, backoff: 0, other: 0 },
+    }));
+  }
+
+  pick() {
+    if (this.endpoints.length === 0) return null;
+    const now = Date.now();
+    const primaries = this.endpoints.filter(e => !e.fallback);
+    const readyPrimaries = primaries.filter(e => now >= e.cooldownUntil);
+    if (readyPrimaries.length > 0) {
+      return readyPrimaries[this.rr++ % readyPrimaries.length];
+    }
+    const fallbacks = this.endpoints.filter(e => e.fallback);
+    const readyFallbacks = fallbacks.filter(e => now >= e.cooldownUntil);
+    if (readyFallbacks.length > 0) {
+      return readyFallbacks[this.rr++ % readyFallbacks.length];
+    }
+    // All cooling down: pick whichever wakes up earliest.
+    return [...this.endpoints].sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
+  }
+
+  report(ep, status) {
+    if (!ep) return;
+    if (DEFAULT_BACKOFF_STATUSES.has(status) || status >= 500) {
+      ep.stats.backoff++;
+      ep.cooldownUntil = Date.now() + ep.cooldownMs;
+    } else if (status >= 200 && status < 400) {
+      ep.stats.ok++;
+    } else if (status > 0) {
+      ep.stats.other++;
+    }
+  }
+
+  snapshot() {
+    const now = Date.now();
+    return this.endpoints.map(e => ({
+      name: e.name,
+      fallback: e.fallback,
+      model: e.model,
+      coolingMs: Math.max(0, e.cooldownUntil - now),
+      ...e.stats,
+    }));
+  }
+}
+
+function estimateBodyTokens(body) {
+  if (!body) return 0;
+  if (typeof body === 'string') return Math.ceil(Buffer.byteLength(body, 'utf8') / 3.5);
+  if (body instanceof Uint8Array || Buffer.isBuffer(body)) return Math.ceil(body.byteLength / 3.5);
+  return 0;
+}
+
+function rewriteEndpointRequest(url, init, primaryBaseUrl, ep) {
+  if (!ep) return { targetUrl: url, targetInit: init };
+  let targetUrl = url;
+  if (primaryBaseUrl && ep.baseUrl && url.startsWith(primaryBaseUrl)) {
+    targetUrl = ep.baseUrl + url.slice(primaryBaseUrl.length);
+  }
+  let targetInit = init;
+  if (ep.model && typeof init?.body === 'string') {
+    try {
+      const parsed = JSON.parse(init.body);
+      if (parsed && typeof parsed === 'object' && parsed.model) {
+        parsed.model = ep.model;
+        targetInit = { ...init, body: JSON.stringify(parsed) };
+      }
+    } catch {}
+  }
+  return { targetUrl, targetInit };
+}
+
 export function installGatedFetch({
   send,
   matchUrl,
+  primaryBaseUrl = null,
   auth = null,
+  router = null,
   getTaskContext = () => null,
   onEvent = () => {},
 }) {
   const nativeFetch = globalThis.fetch;
   const grants = new Map();
-  const retryTracker = new Map(); // taskId -> consecutive failures before 200
+  const retryTracker = new Map();
   let seq = 0;
 
   process.on('message', m => {
@@ -292,20 +494,27 @@ export function installGatedFetch({
     return false;
   };
 
+  const cleanPrimaryBase = primaryBaseUrl ? String(primaryBaseUrl).replace(/\/+$/, '') : null;
+
   globalThis.fetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (!matches(url)) return nativeFetch(input, init);
+    const origUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (!matches(origUrl)) return nativeFetch(input, init);
 
     const taskId = getTaskContext();
     const priorFails = taskId ? retryTracker.get(taskId) || 0 : 0;
     const priority = priorFails > 0 ? 1 : 0;
+    const estTokens = estimateBodyTokens(init?.body);
 
     const slotId = `llm-${process.pid}-${++seq}`;
     const queuedAt = Date.now();
     await new Promise(resolve => {
       grants.set(slotId, resolve);
-      send({ type: 'llm_acquire', id: slotId, priority });
+      send({ type: 'llm_acquire', id: slotId, priority, taskId, estTokens });
     });
+
+    const ep = router ? router.pick() : null;
+    const activeAuth = ep?.auth || auth;
+    const { targetUrl, targetInit } = rewriteEndpointRequest(origUrl, init, cleanPrimaryBase, ep);
 
     const startedAt = Date.now();
     let released = false;
@@ -313,6 +522,7 @@ export function installGatedFetch({
     const release = status => {
       if (released) return;
       released = true;
+      if (ep) router.report(ep, status);
       if (taskId) {
         if (status >= 200 && status < 400) retryTracker.delete(taskId);
         else retryTracker.set(taskId, (retryTracker.get(taskId) || 0) + 1);
@@ -321,29 +531,30 @@ export function installGatedFetch({
         type: 'llm_release',
         id: slotId,
         status,
+        endpoint: ep?.name || null,
         waitMs: startedAt - queuedAt,
         durMs: Date.now() - startedAt,
       });
     };
 
-    init.signal?.addEventListener('abort', () => release(res ? res.status : 0), { once: true });
+    targetInit.signal?.addEventListener('abort', () => release(res ? res.status : 0), { once: true });
     const safety = setTimeout(() => release(0), 35 * 60_000);
     safety.unref();
 
     try {
       const headers = new Headers(
-        init.headers ?? (input instanceof Request ? input.headers : undefined)
+        targetInit.headers ?? (input instanceof Request ? input.headers : undefined)
       );
-      let token = auth ? await auth.getToken() : null;
+      let token = activeAuth ? await activeAuth.getToken() : null;
       if (token) headers.set('authorization', `Bearer ${token}`);
-      res = await nativeFetch(input, { ...init, headers });
+      res = await nativeFetch(targetUrl, { ...targetInit, headers });
 
-      if (res.status === 401 && auth?.invalidate) {
+      if (res.status === 401 && activeAuth?.invalidate) {
         await res.body?.cancel().catch(() => {});
-        auth.invalidate(token);
-        token = await auth.getToken();
+        activeAuth.invalidate(token);
+        token = await activeAuth.getToken();
         if (token) headers.set('authorization', `Bearer ${token}`);
-        res = await nativeFetch(input, { ...init, headers });
+        res = await nativeFetch(targetUrl, { ...targetInit, headers });
       }
     } catch (err) {
       clearTimeout(safety);
@@ -351,7 +562,7 @@ export function installGatedFetch({
       throw err;
     }
 
-    onEvent({ type: 'llm_status', status: res.status });
+    onEvent({ type: 'llm_status', status: res.status, endpoint: ep?.name || null });
     if (!res.ok || !res.body) {
       clearTimeout(safety);
       release(res.status);

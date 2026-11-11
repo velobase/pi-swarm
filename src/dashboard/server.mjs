@@ -90,6 +90,26 @@ export function startDashboardServer({
         res.end(JSON.stringify(await buildState()));
         return;
       }
+      if (url.pathname === '/api/task') {
+        const taskId = url.searchParams.get('id');
+        if (!taskId) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing ?id=' }));
+          return;
+        }
+        const info = await runtimeDb.inspectTask(runId, taskId);
+        res.writeHead(info ? 200 : 404, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify(info || { error: 'Not found' }));
+        return;
+      }
+      if (url.pathname === '/api/tasks') {
+        const status = url.searchParams.get('status') || null;
+        const limit = Number(url.searchParams.get('limit') || 50);
+        const rows = await runtimeDb.listTasksByStatus(runId, status, limit);
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ tasks: rows }));
+        return;
+      }
       if (url.pathname === '/events') {
         res.writeHead(200, {
           'content-type': 'text/event-stream',
