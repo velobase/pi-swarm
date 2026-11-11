@@ -50,7 +50,7 @@ See `examples/batch-job.mjs` for a complete file. The parts that matter:
 
 **Be liberal in what tools accept.** Models under load send stringified JSON, arrays where you expected maps, and slightly wrong ids. Use `parseMaybeJson`, `normalizeKeyedMap` and `fuzzyResolveId`; bind ids to the task's own list. When input really is unusable, throw a message that names the valid values so the agent can correct itself.
 
-**Plan for the output limit.** If one item needs a very long answer (for example the same copy in ten languages), offer a second tool that adds the rest later, and say so in the prompt. A tool call cut off by the output limit is wasted.
+**Plan for the output limit.** The default output limit is 65,535 tokens per reply (`model.maxTokens`); do not lower it to save money, because a tool call cut off by the limit is wasted and has to be redone. Check that your endpoint accepts the value. If one item can still need a very long answer (for example the same copy in ten languages), also offer a second tool that adds the rest later, and say so in the prompt: a shorter reply is cheaper to redo when a request fails midway.
 
 **Put every external resource behind a pool.** Declare it in `pools` and wrap the call in `ctx.pool(name, fn)`. Cache the result with `ctx.cache` so a restart does not repeat it. Count it with `ctx.metric`.
 
@@ -71,7 +71,7 @@ Each of these cost real time once. The scheduler now handles the ones marked "bu
 | Restarting lost everything in progress | Sessions and fetched pages lived only in memory | Built in: sessions are saved after every turn and restored on start; cache and limits persist. Yours: use `ctx.cache` in tools |
 | Scheduler tables ended up in the business database | Convenience | Separate runtime database, always |
 | The model sent `en: {}` before the real call | Parameter typed as "any" | Exact parameter schemas |
-| Tool calls were cut off mid-argument | The answer exceeded the output limit | Let the agent save in parts |
+| Tool calls were cut off mid-argument | The output limit was set to 32,768 and long multi-language answers exceeded it | Built in: default is now 65,535. Yours: let the agent save in parts |
 | Writes to the cache failed on some pages | The page text contained NUL characters, which `jsonb` rejects | Built in: stripped before writing |
 | "ETA 9 minutes" for an hour of work | Progress counted tasks, including ones with nothing to do | Provide `progress()` with your own done and total |
 | A stuck run went unnoticed | Nobody was looking | Dashboard plus a scheduled check, below |
