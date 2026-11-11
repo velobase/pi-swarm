@@ -414,10 +414,19 @@ $('inspectForm').addEventListener('submit', ev => {
 $('drawerClose').addEventListener('click', () => { $('drawerBg').style.display = 'none'; });
 $('drawerBg').addEventListener('click', ev => { if (ev.target === $('drawerBg')) $('drawerBg').style.display = 'none'; });
 
+function pollState() {
+  fetch('api/state', { cache: 'no-store' })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(d => render(d))
+    .catch(() => { $('status').className = 'pill b-warn'; $('status').textContent = T.reconnect; });
+}
 function connect() {
-  const es = new EventSource('events');
-  es.onmessage = e => { try { render(JSON.parse(e.data)); } catch (err) { console.error(err); } };
-  es.onerror = () => { $('status').className = 'pill b-warn'; $('status').textContent = T.reconnect; };
+  pollState();
+  setInterval(pollState, 3000);
+  try {
+    const es = new EventSource('events');
+    es.onmessage = e => { try { render(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+  } catch {}
 }
 connect();
 </script>
