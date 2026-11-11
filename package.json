@@ -19,6 +19,7 @@
     "bin",
     "src",
     "examples",
+    "skill",
     "README.md",
     "LICENSE"
   ],

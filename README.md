@@ -6,6 +6,14 @@ Task-agnostic, PostgreSQL-backed high-concurrency autonomous subagent scheduler 
 
 ---
 
+## For AI agents
+
+This repository is also a skill. [`skill/SKILL.md`](skill/SKILL.md) tells a coding agent how to plan, write, launch and watch a swarm with this scheduler, and lists the failure modes found in production runs. To install it, copy or link the `skill` directory into your agent's skills folder, for example:
+
+```bash
+ln -s "$(pwd)/skill" ~/.claude/skills/pi-swarm
+```
+
 ## Core Guarantees
 
 1. **Zero-Loss PostgreSQL Checkpointing (Isolated `swarm_runtime` DB)**
