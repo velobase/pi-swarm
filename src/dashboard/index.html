@@ -198,10 +198,9 @@ const T = ZH ? {
     healthy:p=>p.ratePerMin==null?'Healthy, measuring throughput':`Healthy, about ${fmtRate(p.ratePerMin)} items/min` },
 };
 document.documentElement.lang = ZH ? 'zh-CN' : 'en';
-$('inspectBtn').textContent = T.inspect;
-
 const $id = id => document.getElementById(id);
 function $(id) { return $id(id); }
+$('inspectBtn').textContent = T.inspect;
 const fmt = n => (Number(n) || 0).toLocaleString();
 const fmtTok = n => { n = Number(n) || 0; return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'K' : String(n); };
 const fmtRate = n => n >= 10 ? Math.round(n).toLocaleString() : (Math.round(n * 10) / 10).toString();
