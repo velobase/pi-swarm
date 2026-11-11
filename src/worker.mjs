@@ -174,19 +174,26 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
 
     const savedEntries = await runtimeDb.loadSession(job.runId, id);
     const isResuming = Array.isArray(savedEntries) && savedEntries.length > 1;
-    manager = isResuming
-      ? SessionManager.inMemory(job.cwd, {}, savedEntries)
-      : SessionManager.inMemory(job.cwd);
+    let isResumingSafe = isResuming;
+    try {
+      manager = isResuming
+        ? SessionManager.inMemory(job.cwd, {}, savedEntries)
+        : SessionManager.inMemory(job.cwd);
+    } catch {
+      // A checkpoint that cannot be restored must never block the task: start fresh.
+      isResumingSafe = false;
+      manager = SessionManager.inMemory(job.cwd);
+    }
 
     const sysPrompt =
       typeof job.systemPrompt === 'function' ? await job.systemPrompt(task, sharedCtx) : job.systemPrompt;
 
-    const created = await createAgentSession({
+    const buildSession = mgr => createAgentSession({
       cwd: job.cwd,
       agentDir,
       modelRuntime,
       model,
-      sessionManager: manager,
+      sessionManager: mgr,
       settingsManager: SettingsManager.inMemory({
         httpIdleTimeoutMs: job.httpIdleTimeoutMs ?? 30 * 60_000,
         compaction: job.compaction ?? {
@@ -202,9 +209,19 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
       customTools,
     });
 
+    let created;
+    try {
+      created = await buildSession(manager);
+    } catch (err) {
+      if (!isResumingSafe) throw err;
+      isResumingSafe = false;
+      manager = SessionManager.inMemory(job.cwd);
+      created = await buildSession(manager);
+    }
+
     session = created.session;
     running.set(id, { session, sessionManager: manager, task });
-    event(id, 'session_ready', { model: session.model?.id, resumed: isResuming });
+    event(id, 'session_ready', { model: session.model?.id, resumed: isResumingSafe });
 
     session.subscribe(e => {
       if (e.type === 'agent_start') event(id, 'agent_start');
@@ -235,7 +252,7 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
       ? '\n' + pendingBroadcasts.map(b => `[BROADCAST:${b.id}]\n${b.text}`).join('\n')
       : '';
 
-    const promptText = isResuming
+    const promptText = isResumingSafe
       ? (typeof job.buildResumePrompt === 'function'
           ? await job.buildResumePrompt(task, pending, sharedCtx)
           : `Session restored from PostgreSQL checkpoint after worker restart. Remaining unfinished items:\n${JSON.stringify(pending)}\nContinue from where you stopped without repeating completed items.`) +

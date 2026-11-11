@@ -170,3 +170,38 @@ test('RuntimeDb persists tasks, sessions, generic KV cache, metrics, and learned
   await db.pool.query(`DELETE FROM swarm_cache WHERE namespace = 'my-ns'`);
   await db.close();
 });
+
+import { errorKey, computeRate, buildProgress, evaluateHealth } from '../src/dashboard/state.mjs';
+
+test('dashboard state: error grouping, rate, progress and health verdicts', () => {
+  const a = errorKey('save_item: [{"type":"text","text":"Handle \\"foo-1\\" is not in task 0012. Valid handles: a, b"}]');
+  const b = errorKey('save_item: [{"type":"text","text":"Handle \\"bar-22\\" is not in task 0931. Valid handles: c, d"}]');
+  assert.equal(a.startsWith('save_item: Handle'), true);
+  assert.equal(a.split('Valid')[0], b.split('Valid')[0]);
+
+  const now = 1_000_000_000;
+  const samples = [{ t: now - 240_000, done: 100 }, { t: now - 120_000, done: 180 }, { t: now, done: 300 }];
+  assert.equal(computeRate(samples, now), 50);
+  assert.equal(computeRate([{ t: now, done: 1 }], now), null);
+
+  // Fallback progress ignores tasks that were already complete at start.
+  const live = { at: new Date(now).toISOString(), tasks: { total: 100, done: 40, skipped: 30, active: 60 } };
+  const fallback = buildProgress({ jobProgress: null, live, samples, now });
+  assert.deepEqual([fallback.done, fallback.total, fallback.source], [10, 70, 'tasks']);
+  const fromJob = buildProgress({ jobProgress: { done: 300, total: 800, unit: 'items' }, live, samples, now });
+  assert.deepEqual([fromJob.done, fromJob.remaining, fromJob.etaSec], [300, 500, 600]);
+
+  const row = (w, waitP95 = 1000) => ({ window: { ok: 0, backoff: 0, other: 0, net: 0, ...w }, waitP95 });
+  const verdict = tl => evaluateHealth({ live, timeline: tl, progress: fromJob, timeoutMs: 300_000, now }).code;
+  assert.equal(verdict([row({ ok: 100 })]), 'healthy');
+  assert.equal(verdict([row({ ok: 10, other: 90 })]), 'upstream_errors');
+  assert.equal(verdict([row({ ok: 100 }, 290_000)]), 'queue_wait');
+  assert.equal(verdict([row({ ok: 40, net: 60 })]), 'network_failures');
+  assert.equal(verdict([row({ ok: 60, backoff: 40 })]), 'rate_limited');
+  assert.equal(evaluateHealth({ live: { ...live, at: new Date(now - 60_000).toISOString() }, timeline: [], progress: fromJob, timeoutMs: 0, now }).code, 'stale');
+});
+
+test('pgJson strips NUL escapes that jsonb rejects', async () => {
+  const { pgJson } = await import('../src/runtime-db.mjs');
+  assert.equal(pgJson({ a: 'x\u0000y' }), '{"a":"xy"}');
+});

@@ -109,6 +109,37 @@ export default defineSwarm({
 });
 ```
 
+### Dashboard hooks (optional)
+
+The dashboard shows scheduler health on its own: a one-line verdict, throughput, queue wait against the request timeout, upstream results per 10 seconds, pools, errors grouped by type and the longest-running tasks. A job can add its own view of the work through three optional fields:
+
+```js
+export default defineSwarm({
+  // ...
+  // What "done" means for this job. Drives the progress bar, throughput and ETA.
+  async progress() {
+    return { done: 1200, total: 8000, unit: 'items', segments: [
+      { label: 'Rewritten', value: 900, tone: 'ok' },
+      { label: 'Removed', value: 300, tone: 'warn' },
+    ] };
+  },
+  // Display names and units for ctx.metric() counters.
+  metricsMeta: { api_calls: { label: 'API calls', unit: 'req' } },
+  // Extra panels rendered under the key numbers. Types: stats, table, bars, text.
+  async dashboardPanels() {
+    return [
+      { title: 'Overview', type: 'stats', items: [{ label: 'Categories', value: '452 / 459', sub: 'described' }] },
+      { title: 'Latest', type: 'table', columns: ['Item', 'Action'], rows: [['foo', 'saved']] },
+      { title: 'Reasons', type: 'bars', unit: 'items', items: [{ label: 'DNS', value: 4337 }] },
+    ];
+  },
+  // Thresholds for the verdict, as a share of httpIdleTimeoutMs or of recent requests.
+  alerts: { queueWaitWarnRatio: 0.5, queueWaitCritRatio: 0.8 },
+});
+```
+
+Without `progress()`, the bar falls back to task counts and ignores tasks that needed no work at start. The page is read-only; control stays on the CLI.
+
 ### CLI Operations
 
 ```bash

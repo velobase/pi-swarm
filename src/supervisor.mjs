@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Gate, SlotPool } from './gate.mjs';
 import { RuntimeDb } from './runtime-db.mjs';
 import { startDashboardServer } from './dashboard/server.mjs';
+import { errorKey } from './dashboard/state.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const redact = s => String(s || '').replace(/sk-[A-Za-z0-9_-]+/g, '[REDACTED]').slice(0, 600);
@@ -94,6 +95,8 @@ export async function runSupervisor({
     };
     if (states[row.id].status === 'pending') queue.push(row.id);
   }
+  // Tasks that needed no work in this process (complete before start, or nothing pending).
+  let skipped = Object.values(states).filter(s => s.status === 'complete').length;
 
   const startedMs = Date.now();
   const RUN = {
@@ -121,10 +124,18 @@ export async function runSupervisor({
   const metrics = { ...(restored.metrics || {}) };
   let latestSnapshot = null;
 
+  const errorGroups = new Map(); // group key -> { count, lastAt, lastTask, sample }
   function recordError(taskId, text) {
     const e = { id: taskId, at: new Date().toISOString(), error: redact(text) };
     recentFailures.push(e);
     if (recentFailures.length > 25) recentFailures.shift();
+    const key = errorKey(e.error);
+    const g = errorGroups.get(key) || { count: 0 };
+    errorGroups.set(key, { count: g.count + 1, lastAt: e.at, lastTask: taskId, sample: e.error });
+    if (errorGroups.size > 200) {
+      const smallest = [...errorGroups.entries()].sort((a, b) => a[1].count - b[1].count)[0];
+      errorGroups.delete(smallest[0]);
+    }
   }
 
   function pendingBroadcastsFor(taskId) {
@@ -154,6 +165,7 @@ export async function runSupervisor({
       s.status = 'running';
       s.attempt = (s.attempt || 0) + 1;
       s.worker = w.index;
+      s.startedAt = Date.now();
       w.tasks.add(id);
       void runtimeDb.markTaskRunning(job.runId, id, w.index, s.attempt).catch(() => {});
       w.child.send({
@@ -181,6 +193,7 @@ export async function runSupervisor({
     if (!s || s.status !== 'running') return;
     w.tasks.delete(id);
     if (message.continuations) piContinuations += Number(message.continuations) || 0;
+    if (message.stopReason === 'already_complete') skipped++;
     if (message.error) {
       s.lastError = redact(message.error);
       recordError(id, message.error);
@@ -446,18 +459,31 @@ export async function runSupervisor({
       run: RUN,
       at: new Date().toISOString(),
       finishedAt,
-      elapsedSec: Math.round(((finishedAt ? Date.parse(finishedAt) : Date.now()) - startedMs) / 1000),
+      elapsedSec: Math.round(((finishedAt ? Date.parse(finishedAt) : Date.now()) - Date.parse(RUN.startedAt)) / 1000),
+      processUptimeSec: Math.round((Date.now() - startedMs) / 1000),
       resumedSessions,
       tasks: {
         total: all.length,
         done,
         ok: done,
         failed: backoff,
+        backoff,
+        skipped,
         active,
       },
+      timeoutMs: Number(job.httpIdleTimeoutMs || 0),
       gate: gate.snapshot(false),
       pools: buildPoolsSnapshot(),
       metrics: { ...metrics },
+      errorGroups: [...errorGroups.entries()]
+        .map(([key, g]) => ({ key, ...g }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 12),
+      longestRunning: all
+        .filter(s => s.status === 'running' && s.startedAt)
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .slice(0, 5)
+        .map(s => ({ id: s.task, runningSec: Math.round((Date.now() - s.startedAt) / 1000), attempt: s.attempt })),
       pi: { retries: piRetries, continuations: piContinuations },
       counters: { toolSuccess, toolErrors },
       recentFailures,
@@ -487,7 +513,7 @@ export async function runSupervisor({
       runId: job.runId,
       runtimeDb,
       getLiveInMemory: () => ({ live: latestSnapshot || buildLiveObject(), timeline }),
-      dashboardCounters: job.dashboardCounters,
+      job,
     });
     console.log(`pi-swarm dashboard listening on http://${dashboardHost}:${effectiveDashPort}`);
   }

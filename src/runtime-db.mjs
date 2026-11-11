@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS swarm_broadcasts (
 );
 `;
 
+/** JSON text safe for jsonb: PostgreSQL rejects the \\u0000 escape. */
+export const pgJson = value => JSON.stringify(value).replace(/\\u0000/g, '');
+
 export function sanitizeSessionEntriesForResume(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return null;
   const cloned = entries.slice();
@@ -229,7 +232,7 @@ export class RuntimeDb {
        ON CONFLICT (run_id, task_id) DO UPDATE SET
          entries = EXCLUDED.entries,
          updated_at = now()`,
-      [runId, taskId, JSON.stringify(entries)]
+      [runId, taskId, pgJson(entries)]
     );
   }
 
@@ -256,7 +259,7 @@ export class RuntimeDb {
        ON CONFLICT (namespace, cache_key) DO UPDATE SET
          value = EXCLUDED.value,
          created_at = now()`,
-      [String(namespace), String(key), JSON.stringify(value)]
+      [String(namespace), String(key), pgJson(value)]
     );
   }
 
