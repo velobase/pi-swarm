@@ -1,7 +1,8 @@
 /**
- * Swarm Worker process: hosts up to N concurrent Pi AgentSessions,
- * snapshots session state to PostgreSQL (`swarm_sessions`) after every turn,
- * seamlessly resumes interrupted sessions on restart, and routes all LLM/curl/Jina calls through Supervisor gates.
+ * Swarm Worker process: task-agnostic host for up to N concurrent Pi AgentSessions.
+ * Snapshots session state to PostgreSQL (`swarm_sessions`) after every turn,
+ * resumes interrupted sessions seamlessly on restart, and exposes generic
+ * `ctx.pool(name, fn)`, `ctx.cache`, and `ctx.metric(name, delta)` primitives to job tools.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { pathToFileURL } from 'node:url';
@@ -12,7 +13,6 @@ import {
   createStaticAuth,
 } from './gate.mjs';
 import { RuntimeDb } from './runtime-db.mjs';
-import { createBuiltinTools } from './builtin-tools.mjs';
 import { loadPiSdk, createJobModelRuntime } from './sdk-loader.mjs';
 import { parseMaybeJson } from './index.mjs';
 
@@ -28,7 +28,7 @@ const jobMod = await import(pathToFileURL(jobPath).href);
 const job = typeof jobMod.default === 'function' ? await jobMod.default() : jobMod.default;
 
 const local = new AsyncLocalStorage();
-const running = new Map(); // taskId -> { session, sessionManager, task }
+const running = new Map();
 let stopping = false;
 
 const send = data => {
@@ -70,8 +70,24 @@ const nativeFetch = installGatedFetch({
   },
 });
 
-const withCurlSlot = makeSlotClient('curl', send);
-const withJinaSlot = makeSlotClient('jina', send);
+const slotClients = new Map();
+function withNamedPool(name, fn) {
+  let client = slotClients.get(name);
+  if (!client) {
+    client = makeSlotClient(String(name), send);
+    slotClients.set(name, client);
+  }
+  return client(fn);
+}
+
+const cacheHelper = {
+  get: (namespace, key, ttlSec = 0) => runtimeDb.cacheGet(namespace, key, ttlSec),
+  set: (namespace, key, value) => runtimeDb.cacheSet(namespace, key, value),
+};
+
+function reportMetric(name, delta = 1) {
+  send({ type: 'metric', name: String(name), delta: Number(delta) || 0 });
+}
 
 const { sdk, Type } = await loadPiSdk();
 const { createAgentSession, SessionManager, SettingsManager, createExtensionRuntime } = sdk;
@@ -113,6 +129,15 @@ function wrapUserTool(tool) {
   };
 }
 
+const sharedCtx = {
+  Type,
+  pool: withNamedPool,
+  cache: cacheHelper,
+  metric: reportMetric,
+  nativeFetch,
+  runtimeDb,
+};
+
 async function runTask(task, attempt, pendingBroadcasts = []) {
   const id = String(task.id);
   let session;
@@ -131,7 +156,7 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
   try {
     let pending = task.payload;
     if (typeof job.loadPending === 'function') {
-      pending = await job.loadPending(task, { runtimeDb });
+      pending = await job.loadPending(task, sharedCtx);
       if (
         pending === null ||
         pending === undefined ||
@@ -143,19 +168,8 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
       }
     }
 
-    const builtins = createBuiltinTools({
-      Type,
-      runtimeDb,
-      withCurlSlot,
-      withJinaSlot,
-      nativeFetch,
-      send,
-      cacheTtlSec: job.fetchCacheTtlSec ?? 86_400,
-      jinaApiKey: job.jinaApiKey ?? null,
-    });
-
     const rawTools =
-      typeof job.tools === 'function' ? await job.tools(task, { Type, builtins, runtimeDb }) : [];
+      typeof job.tools === 'function' ? await job.tools(task, sharedCtx) : [];
     const customTools = rawTools.map(wrapUserTool);
 
     const savedEntries = await runtimeDb.loadSession(job.runId, id);
@@ -165,7 +179,7 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
       : SessionManager.inMemory(job.cwd);
 
     const sysPrompt =
-      typeof job.systemPrompt === 'function' ? await job.systemPrompt(task) : job.systemPrompt;
+      typeof job.systemPrompt === 'function' ? await job.systemPrompt(task, sharedCtx) : job.systemPrompt;
 
     const created = await createAgentSession({
       cwd: job.cwd,
@@ -223,10 +237,10 @@ async function runTask(task, attempt, pendingBroadcasts = []) {
 
     const promptText = isResuming
       ? (typeof job.buildResumePrompt === 'function'
-          ? await job.buildResumePrompt(task, pending)
+          ? await job.buildResumePrompt(task, pending, sharedCtx)
           : `Session restored from PostgreSQL checkpoint after worker restart. Remaining unfinished items:\n${JSON.stringify(pending)}\nContinue from where you stopped without repeating completed items.`) +
         bcBlock
-      : (await job.buildPrompt(task, pending)) + bcBlock;
+      : (await job.buildPrompt(task, pending, sharedCtx)) + bcBlock;
 
     await local.run(id, () => session.prompt(promptText, { expandPromptTemplates: false }));
 

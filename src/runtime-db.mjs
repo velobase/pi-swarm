@@ -1,5 +1,5 @@
 /**
- * Dedicated PostgreSQL state & checkpoint store (`swarm_runtime`),
+ * Task-agnostic PostgreSQL state & checkpoint store (`swarm_runtime`),
  * strictly isolated from business databases.
  */
 import pg from 'pg';
@@ -13,8 +13,7 @@ CREATE TABLE IF NOT EXISTS swarm_runs (
   config      jsonb NOT NULL DEFAULT '{}'::jsonb,
   gate_limit  double precision NOT NULL DEFAULT 300,
   pools       jsonb NOT NULL DEFAULT '{}'::jsonb,
-  jina_calls  bigint NOT NULL DEFAULT 0,
-  jina_tokens bigint NOT NULL DEFAULT 0,
+  metrics     jsonb NOT NULL DEFAULT '{}'::jsonb,
   snapshot    jsonb NOT NULL DEFAULT '{}'::jsonb,
   timeline    jsonb NOT NULL DEFAULT '[]'::jsonb,
   started_at  timestamptz NOT NULL DEFAULT now(),
@@ -46,13 +45,12 @@ CREATE TABLE IF NOT EXISTS swarm_sessions (
   FOREIGN KEY (run_id, task_id) REFERENCES swarm_tasks(run_id, task_id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS swarm_fetch_cache (
-  url         text NOT NULL,
-  via         text NOT NULL,
-  ok          boolean NOT NULL,
-  payload     jsonb NOT NULL,
-  fetched_at  timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (url, via)
+CREATE TABLE IF NOT EXISTS swarm_cache (
+  namespace   text NOT NULL,
+  cache_key   text NOT NULL,
+  value       jsonb NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (namespace, cache_key)
 );
 
 CREATE TABLE IF NOT EXISTS swarm_broadcasts (
@@ -70,7 +68,6 @@ CREATE TABLE IF NOT EXISTS swarm_broadcasts (
 export function sanitizeSessionEntriesForResume(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return null;
   const cloned = entries.slice();
-  // Drop trailing incomplete or errored assistant message frames so continuation starts cleanly.
   while (cloned.length > 1) {
     const tail = cloned[cloned.length - 1];
     const msg = tail?.message || tail;
@@ -119,11 +116,10 @@ export class RuntimeDb {
            name = EXCLUDED.name,
            heartbeat = now(),
            finished_at = NULL
-         RETURNING gate_limit, pools, jina_calls, jina_tokens, started_at, timeline`,
+         RETURNING gate_limit, pools, metrics, started_at, timeline`,
         [runId, name || runId, JSON.stringify(config || {}), defaultGateLimit, JSON.stringify(defaultPools)]
       );
 
-      // Reset interrupted in-flight tasks back to pending so workers resume them from session checkpoints.
       await c.query(
         `UPDATE swarm_tasks
          SET status = 'pending', worker_id = NULL, updated_at = now()
@@ -153,8 +149,7 @@ export class RuntimeDb {
       return {
         gateLimit: Number(row.gate_limit || defaultGateLimit),
         pools: row.pools || defaultPools,
-        jinaCalls: Number(row.jina_calls || 0),
-        jinaTokens: Number(row.jina_tokens || 0),
+        metrics: row.metrics || {},
         startedAt: row.started_at,
         timeline: Array.isArray(row.timeline) ? row.timeline : [],
       };
@@ -238,27 +233,30 @@ export class RuntimeDb {
     );
   }
 
-  async getCachedFetch(url, via, ttlSec = 86_400) {
-    const res = await this.pool.query(
-      `SELECT ok, payload
-       FROM swarm_fetch_cache
-       WHERE url = $1 AND via = $2
-         AND fetched_at >= now() - ($3::int * interval '1 second')`,
-      [url, via, ttlSec]
-    );
-    if (!res.rowCount) return null;
-    return { cached: true, ...res.rows[0].payload };
+  async cacheGet(namespace, key, ttlSec = 0) {
+    const res =
+      ttlSec > 0
+        ? await this.pool.query(
+            `SELECT value FROM swarm_cache
+             WHERE namespace = $1 AND cache_key = $2
+               AND created_at >= now() - ($3::int * interval '1 second')`,
+            [String(namespace), String(key), ttlSec]
+          )
+        : await this.pool.query(
+            `SELECT value FROM swarm_cache WHERE namespace = $1 AND cache_key = $2`,
+            [String(namespace), String(key)]
+          );
+    return res.rowCount ? res.rows[0].value : undefined;
   }
 
-  async putCachedFetch(url, via, ok, payload) {
+  async cacheSet(namespace, key, value) {
     await this.pool.query(
-      `INSERT INTO swarm_fetch_cache (url, via, ok, payload, fetched_at)
-       VALUES ($1, $2, $3, $4::jsonb, now())
-       ON CONFLICT (url, via) DO UPDATE SET
-         ok = EXCLUDED.ok,
-         payload = EXCLUDED.payload,
-         fetched_at = now()`,
-      [url, via, Boolean(ok), JSON.stringify(payload)]
+      `INSERT INTO swarm_cache (namespace, cache_key, value, created_at)
+       VALUES ($1, $2, $3::jsonb, now())
+       ON CONFLICT (namespace, cache_key) DO UPDATE SET
+         value = EXCLUDED.value,
+         created_at = now()`,
+      [String(namespace), String(key), JSON.stringify(value)]
     );
   }
 
@@ -280,24 +278,22 @@ export class RuntimeDb {
     );
   }
 
-  async saveHeartbeat(runId, { gateLimit, pools, jinaCalls, jinaTokens, snapshot, timeline, finishedAt = null }) {
+  async saveHeartbeat(runId, { gateLimit, pools, metrics, snapshot, timeline, finishedAt = null }) {
     await this.pool.query(
       `UPDATE swarm_runs
        SET gate_limit = $2,
            pools = $3::jsonb,
-           jina_calls = $4,
-           jina_tokens = $5,
-           snapshot = $6::jsonb,
-           timeline = COALESCE($7::jsonb, timeline),
+           metrics = $4::jsonb,
+           snapshot = $5::jsonb,
+           timeline = COALESCE($6::jsonb, timeline),
            heartbeat = now(),
-           finished_at = COALESCE($8::timestamptz, finished_at)
+           finished_at = COALESCE($7::timestamptz, finished_at)
        WHERE run_id = $1`,
       [
         runId,
         gateLimit,
         JSON.stringify(pools || {}),
-        jinaCalls || 0,
-        jinaTokens || 0,
+        JSON.stringify(metrics || {}),
         JSON.stringify(snapshot || {}),
         timeline ? JSON.stringify(timeline.slice(-720)) : null,
         finishedAt,
@@ -307,7 +303,7 @@ export class RuntimeDb {
 
   async getRunDashboardState(runId) {
     const res = await this.pool.query(
-      `SELECT run_id, name, gate_limit, pools, jina_calls, jina_tokens, snapshot, timeline, started_at, heartbeat, finished_at
+      `SELECT run_id, name, gate_limit, pools, metrics, snapshot, timeline, started_at, heartbeat, finished_at
        FROM swarm_runs
        WHERE run_id = $1`,
       [runId]

@@ -1,34 +1,33 @@
 # `@velobase/pi-swarm`
 
-PostgreSQL-backed high-concurrency autonomous subagent orchestrator for `@earendil-works/pi-coding-agent` (e.g., **30 Node workers × 100 async sessions = 3,000 concurrent autonomous agents**).
+Task-agnostic, PostgreSQL-backed high-concurrency autonomous subagent scheduler for `@earendil-works/pi-coding-agent` (e.g., **30 Node workers × 100 async sessions = 3,000 concurrent autonomous agents**).
 
-Built from real-world 30,000+ item production crawls, multilingual copy-rewrites, and catalog audits—eliminating cold-restart context loss, local DNS/conntrack exhaustion, OAuth token expiry storms, and upstream rate-limit queue starvation.
+`@velobase/pi-swarm` owns **only** scheduling, session checkpointing, upstream rate gating, and live control—never assuming what tools, APIs, or schemas your batch job uses.
 
 ---
 
-## Why `pi-swarm`?
+## Core Guarantees
 
-Running thousands of autonomous LLM sessions concurrently exposes failure modes that ad-hoc scripts miss:
-
-1. **Zero-Loss PostgreSQL Checkpointing (Strict Runtime/Business DB Isolation)**
-   - Runtime state lives in a dedicated `swarm_runtime` PostgreSQL database (`swarm_runs`, `swarm_tasks`, `swarm_sessions`, `swarm_fetch_cache`, `swarm_broadcasts`), keeping your production/business database 100% clean for `pg_dump`.
-   - **No lost web fetches**: Built-in `webfetch` (`curl` + Chrome UA) and `jina_read` (`r.jina.ai`) cache responses in `swarm_fetch_cache`. Restarts never re-crawl or re-burn Jina tokens.
-   - **No lost in-flight conversations**: After every tool execution and model turn, `[header, ...entries]` is persisted to `swarm_sessions`. On restart, interrupted sessions restore seamlessly via `SessionManager.inMemory(cwd, {}, entries)` and continue where they stopped.
-   - **No lost AIMD rate-limit tuning**: Learned concurrency limits (`gate_limit`) and pool settings persist in `swarm_runs` across restarts.
+1. **Zero-Loss PostgreSQL Checkpointing (Isolated `swarm_runtime` DB)**
+   - Runtime tables (`swarm_runs`, `swarm_tasks`, `swarm_sessions`, `swarm_cache`, `swarm_broadcasts`) live in a dedicated runtime database (`SWARM_DATABASE_URL`), keeping your business database 100% clean.
+   - **Session checkpoint & resume**: After every tool execution and model turn, `[header, ...entries]` is upserted to `swarm_sessions`. On restart or worker crash, interrupted sessions restore in-memory via `SessionManager.inMemory(cwd, {}, entries)` and continue seamlessly; completed sessions are pruned automatically.
+   - **Persistent KV cache (`ctx.cache`)**: Generic `cache.get(ns, key, ttlSec)` / `cache.set(ns, key, val)` backed by `swarm_cache` so custom tools never repeat expensive external I/O after restarts.
+   - **Persistent learned limits**: AIMD `gate_limit`, named pool limits, and custom job `metrics` persist in `swarm_runs` across restarts.
 
 2. **Adaptive Upstream AIMD Gate + Priority Retry Queue**
-   - Dynamically probes upstream capacity (e.g., Google Vertex AI Dynamic Shared Quota) via Additive-Increase / Multiplicative-Decrease (`Gate`), with a single decrease per cooldown window so burst `429`s never collapse throughput.
-   - **Priority retry queue**: Retried turns jump ahead of cold first-attempt requests so long-running sessions never starve behind 2,900 queued newcomers.
-   - **30-minute HTTP idle timeout** (`httpIdleTimeoutMs: 1_800_000`) prevents local queue wait time from triggering Node `undici` 300s self-abort loops.
-   - **Transparent OAuth / `401` self-healing**: Built-in `gcloud-vertex` auth checks real token TTL via `oauth2.googleapis.com/tokeninfo` and transparently refreshes + retries once inside the same slot on HTTP `401`.
+   - Probes upstream LLM capacity dynamically via Additive-Increase / Multiplicative-Decrease (`Gate`), with a single decrease per cooldown window.
+   - **Priority retry queue**: Retried turns jump ahead of cold first-attempt requests so active sessions never starve behind queued newcomers.
+   - **30-minute HTTP idle timeout** (`httpIdleTimeoutMs: 1_800_000`) prevents local queue waiting from triggering Node `undici` 300s self-abort loops.
+   - **Pluggable auth & `401` self-healing**: Supports `$ENV_VAR`, custom `{ getToken, invalidate }`, or `gcloud-vertex` (queries real OAuth TTL and transparently refreshes + retries once inside the same slot on HTTP `401`).
 
-3. **Bounded External Tool Pools (`SlotPool`)**
-   - Central Supervisor FIFO + sliding-window RPM limiters for external I/O (`curl` concurrency cap to protect local DNS/conntrack; `jina` concurrency + 480 RPM cap to respect API rate limits).
+3. **Generic Named Resource Pools (`ctx.pool`) & Metrics (`ctx.metric`)**
+   - Zero hardcoded external tools. Declare any external resource caps your job needs in `pools: { [name]: { limit, perMinute } }` and wrap calls in `ctx.pool(name, fn)` inside your custom tools.
+   - Emit arbitrary job counters via `ctx.metric(name, delta)`—automatically aggregated and rendered on the live dashboard.
 
 4. **Live Control Plane & Zero-Dependency SSE Dashboard**
-   - `pi-swarm steer`: Millisecond broadcast to all 3,000 live sessions (`--interrupt` to abort slow turns and redirect immediately) with delivery & consumption receipts.
-   - `pi-swarm limit`: Hot-tune `gate`, `curl`, or `jina` concurrency/RPM limits online without restarting workers.
-   - Built-in real-time dark/light SSE telemetry dashboard (`--dashboard 3010`).
+   - `pi-swarm steer`: Millisecond broadcast to all live sessions (`--interrupt` to abort slow streaming turns immediately) with delivery & consumption receipts.
+   - `pi-swarm limit`: Hot-tune `gate` or any named `<poolName>` concurrency/RPM online without restarting.
+   - Built-in real-time SSE telemetry dashboard (`--dashboard 3010`).
 
 ---
 
@@ -41,43 +40,28 @@ git clone https://github.com/velobase/pi-swarm.git
 cd pi-swarm && npm install && npm link
 ```
 
-Requires Node.js `>= 20`, PostgreSQL `>= 14`, and `@earendil-works/pi-coding-agent`.
-
 ---
 
 ## Quick Start
-
-### 1. Provision an isolated local runtime database
-
-Keep runtime checkpoints separate from your business database:
-
-```bash
-sudo -u postgres psql -p 15432 -c "CREATE USER swarm_runtime WITH PASSWORD 'local_swarm_pw';"
-sudo -u postgres psql -p 15432 -c "CREATE DATABASE swarm_runtime OWNER swarm_runtime;"
-export SWARM_DATABASE_URL="postgresql://swarm_runtime:local_swarm_pw@127.0.0.1:15432/swarm_runtime"
-```
-
-### 2. Define a job in a single file (`job.mjs`)
 
 ```js
 import { defineSwarm, parseMaybeJson, fuzzyResolveId } from '@velobase/pi-swarm';
 
 export default defineSwarm({
-  runId: 'catalog-audit-2026',
-  name: 'Catalog Audit & 10-Locale Copy Rewrite',
+  runId: 'my-batch-job-v1',
+  name: 'My 3,000-Agent Batch Job',
   concurrency: 3000,
   workers: 30,
   model: {
-    provider: 'vertex-ds',
-    id: 'deepseek-ai/deepseek-v4.1-flash-maas',
-    vertexProject: 'my-gcp-project',
-    vertexLocation: 'global',
-    auth: 'gcloud-vertex',
+    provider: 'openai-compat',
+    id: 'deepseek-chat',
+    baseUrl: 'https://api.deepseek.com/v1',
+    apiKey: '$DEEPSEEK_API_KEY',
   },
   gate: { limit: 300, min: 50, max: 1500 },
+  // Optional: declare named concurrency / RPM pools for external APIs your tools call
   pools: {
-    curl: { limit: 300 },
-    jina: { limit: 300, perMinute: 480 },
+    githubApi: { limit: 80, perMinute: 4500 },
   },
 
   async tasks() {
@@ -85,23 +69,39 @@ export default defineSwarm({
   },
 
   async loadPending(task) {
-    // Query business DB for remaining items in this task; returning [] marks task complete
+    // Query business DB for remaining items; returning [] marks task complete
   },
 
-  systemPrompt: 'You are an autonomous auditor...',
-  buildPrompt: (task, pending) => `Process remaining items:\n${JSON.stringify(pending)}`,
+  systemPrompt: 'You are an autonomous worker...',
+  buildPrompt: (_task, pending) => `Process items:\n${JSON.stringify(pending)}`,
 
-  tools: (task, { Type, builtins }) => [
-    builtins.webfetch,
-    builtins.jinaRead,
+  tools: (task, { Type, pool, cache, metric, nativeFetch }) => [
     {
-      name: 'save_item',
-      label: 'Save item to business PostgreSQL',
-      description: 'Atomically persist structured output.',
-      parameters: Type.Object({ id: Type.String(), data: Type.Any() }),
+      name: 'lookup_repo',
+      label: 'Fetch repo metadata',
+      description: 'Fetch metadata with global pooling and PG cache.',
+      parameters: Type.Object({ repo: Type.String() }),
+      execute: async (_callId, { repo }) => {
+        const cached = await cache.get('gh', repo, 86_400);
+        if (cached !== undefined) return { content: [{ type: 'text', text: JSON.stringify(cached) }] };
+        const res = await pool('githubApi', async () => {
+          const r = await nativeFetch(`https://api.github.com/repos/${repo}`);
+          return r.json();
+        });
+        metric('gh_calls', 1);
+        await cache.set('gh', repo, res);
+        return { content: [{ type: 'text', text: JSON.stringify(res) }] };
+      },
+    },
+    {
+      name: 'save_output',
+      label: 'Persist output to business DB',
+      description: 'Write structured result.',
+      parameters: Type.Object({ id: Type.String(), result: Type.Any() }),
       execute: async (_callId, raw) => {
-        const args = parseMaybeJson(raw); // Liberal JSON normalization built in
-        // Write to your business PostgreSQL pool...
+        const args = parseMaybeJson(raw);
+        // Write to business DB...
+        metric('saved', 1);
         return { content: [{ type: 'text', text: '{"ok":true}' }] };
       },
     },
@@ -109,23 +109,14 @@ export default defineSwarm({
 });
 ```
 
-### 3. Run & Operate
+### CLI Operations
 
 ```bash
-# Start 3,000 concurrent sessions + live SSE dashboard on port 3010
 pi-swarm run ./job.mjs --dashboard 3010
-
-# Steer all live sessions without restarting
-pi-swarm steer --job ./job.mjs "Skip unreachable .onion domains and keep existing metadata."
-
-# Interrupt slow streaming sessions immediately with new guidance
-pi-swarm steer --job ./job.mjs --interrupt "Prioritize concise 2-paragraph overviews."
-
-# Hot-adjust gate or tool pool limits online
+pi-swarm steer --job ./job.mjs "Updated instruction for all active agents"
+pi-swarm steer --job ./job.mjs --interrupt "Abort slow turns and apply new rule immediately"
 pi-swarm limit --job ./job.mjs --pool gate --limit 1200 --max 1500
-pi-swarm limit --job ./job.mjs --pool curl --limit 400
-
-# Inspect live JSON status
+pi-swarm limit --job ./job.mjs --pool githubApi --limit 150 --rpm 4800
 pi-swarm status --job ./job.mjs
 ```
 

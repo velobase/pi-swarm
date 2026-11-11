@@ -22,9 +22,9 @@ test('liberal input normalizers handle stringified JSON and fuzzy IDs', () => {
   assert.equal(localeMap.zh.name, '你好');
   assert.equal(localeMap.ja.name, 'こんにちは');
 
-  const owned = ['qwen-image-2-1', 'gpt-quiz-maker-for-google-forms'];
-  assert.equal(fuzzyResolveId(owned, 'qwen_image_2_1'), 'qwen-image-2-1');
-  assert.equal(fuzzyResolveId(owned, 'gpt-quiz-maker'), 'gpt-quiz-maker-for-google-forms');
+  const owned = ['item-alpha-2-1', 'item-beta-long-slug'];
+  assert.equal(fuzzyResolveId(owned, 'item_alpha_2_1'), 'item-alpha-2-1');
+  assert.equal(fuzzyResolveId(owned, 'item-beta'), 'item-beta-long-slug');
   assert.equal(fuzzyResolveId(owned, 'completely-unrelated'), null);
 });
 
@@ -49,12 +49,10 @@ test('Gate enforces AIMD, priority retry queue, and worker crash cleanup', () =>
   assert.equal(gate.inflight, 2);
   assert.equal(gate.waitingCount, 2);
 
-  // Release r1 with 200 -> priority retry-4 MUST jump ahead of cold-3
   gate.release('r1', 200);
   assert.deepEqual(order, ['r1', 'r2', 'retry-4']);
   assert.equal(gate.snapshot().rawLimit, 2.5);
 
-  // Worker 1 crashes while holding r2 -> slot freed immediately and cold-3 is granted
   gate.dropWorker(1);
   assert.deepEqual(order, ['r1', 'r2', 'retry-4', 'cold-3']);
   gate.close();
@@ -68,11 +66,11 @@ test('SlotPool enforces concurrency and sliding-window RPM limits', () => {
   pool.acquire('c', 0, () => granted++);
   pool.acquire('d', 0, () => granted++);
 
-  assert.equal(granted, 2); // concurrency capped at 2
+  assert.equal(granted, 2);
   pool.release('a');
-  assert.equal(granted, 3); // 3rd granted (hits perMinute=3)
+  assert.equal(granted, 3);
   pool.release('b');
-  assert.equal(granted, 3); // 4th held back by perMinute=3 cap!
+  assert.equal(granted, 3);
   assert.equal(pool.snapshot().waiting, 1);
 
   pool.setLimits({ perMinute: 10 });
@@ -85,7 +83,7 @@ test('sanitizeSessionEntriesForResume strips trailing errored assistant turn', (
     { type: 'session', id: 's1' },
     { type: 'message', message: { role: 'user', content: 'hi' } },
     { type: 'message', message: { role: 'assistant', stopReason: 'toolUse', content: [] } },
-    { type: 'message', message: { role: 'toolResult', content: 'fetched page' } },
+    { type: 'message', message: { role: 'toolResult', content: 'tool output' } },
     { type: 'message', message: { role: 'assistant', stopReason: 'error', errorMessage: '401' } },
   ];
   const cleaned = sanitizeSessionEntriesForResume(entries);
@@ -93,19 +91,19 @@ test('sanitizeSessionEntriesForResume strips trailing errored assistant turn', (
   assert.equal(cleaned.at(-1).message.role, 'toolResult');
 });
 
-test('defineSwarm validates required fields and applies safe defaults', () => {
+test('defineSwarm has zero hardcoded task-specific pools', () => {
   const spec = defineSwarm({
     runId: 'unit-run',
-    model: { provider: 'vertex-ds', id: 'deepseek-ai/deepseek-v4.1-flash-maas', vertexProject: 'p' },
+    model: { provider: 'v', id: 'm', baseUrl: 'https://example.com/v1' },
     tasks: [{ id: '1', payload: {} }],
     buildPrompt: () => 'go',
   });
   assert.equal(spec.concurrency, 3000);
   assert.equal(spec.httpIdleTimeoutMs, 1_800_000);
-  assert.equal(spec.retry.maxRetries, 30);
+  assert.deepEqual(spec.pools, {});
 });
 
-test('RuntimeDb persists tasks, sessions, fetch_cache, and learned gate limits in PostgreSQL', async t => {
+test('RuntimeDb persists tasks, sessions, generic KV cache, metrics, and learned gate limits', async t => {
   const url = process.env.TEST_SWARM_DATABASE_URL;
   if (!url) {
     t.skip('TEST_SWARM_DATABASE_URL not set');
@@ -135,14 +133,12 @@ test('RuntimeDb persists tasks, sessions, fetch_cache, and learned gate limits i
   ]);
   await db.saveHeartbeat(runId, {
     gateLimit: 880,
-    pools: { curl: { limit: 300 } },
-    jinaCalls: 12,
-    jinaTokens: 9500,
+    pools: { githubApi: { limit: 80 } },
+    metrics: { api_calls: 42, tokens_used: 9500 },
     snapshot: { tasks: { total: 2, done: 0 } },
     timeline: [{ t: 10, limit: 880 }],
   });
 
-  // Simulate process restart: running task resets to pending, learned gateLimit (880) is inherited, session is restored clean
   const init2 = await db.initRun({
     runId,
     name: 'Integration Test',
@@ -154,7 +150,7 @@ test('RuntimeDb persists tasks, sessions, fetch_cache, and learned gate limits i
     defaultGateLimit: 250,
   });
   assert.equal(init2.gateLimit, 880);
-  assert.equal(init2.jinaTokens, 9500);
+  assert.equal(init2.metrics.tokens_used, 9500);
 
   const tasks = await db.loadTasks(runId);
   assert.equal(tasks[0].status, 'pending');
@@ -162,17 +158,15 @@ test('RuntimeDb persists tasks, sessions, fetch_cache, and learned gate limits i
   const restoredSession = await db.loadSession(runId, '0001');
   assert.equal(restoredSession.length, 2);
 
-  // Fetch cache roundtrip
-  await db.putCachedFetch('https://example.com', 'curl', true, { ok: true, httpStatus: 200, title: 'Example' });
-  const hit = await db.getCachedFetch('https://example.com', 'curl', 3600);
-  assert.equal(hit.cached, true);
-  assert.equal(hit.title, 'Example');
+  await db.cacheSet('my-ns', 'key-1', { ok: true, data: [1, 2, 3] });
+  const hit = await db.cacheGet('my-ns', 'key-1', 3600);
+  assert.deepEqual(hit, { ok: true, data: [1, 2, 3] });
 
-  // Task completion prunes session entry automatically
   await db.markTaskComplete(runId, '0001', { retainSession: false });
   const afterComplete = await db.loadSession(runId, '0001');
   assert.equal(afterComplete, null);
 
   await db.pool.query(`DELETE FROM swarm_runs WHERE run_id = $1`, [runId]);
+  await db.pool.query(`DELETE FROM swarm_cache WHERE namespace = 'my-ns'`);
   await db.close();
 });

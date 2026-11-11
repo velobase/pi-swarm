@@ -3,7 +3,7 @@
  * CLI for @velobase/pi-swarm:
  *   pi-swarm run <job.mjs> [--concurrency 3000] [--workers 30] [--dashboard 3010] [--runtime-db postgres://...]
  *   pi-swarm steer --run <runId> [--interrupt] [--tasks t1,t2] "<instruction>"
- *   pi-swarm limit --run <runId> --pool gate|curl|jina [--limit N] [--min N] [--max N] [--rpm M]
+ *   pi-swarm limit --run <runId> --pool <gate|poolName> [--limit N] [--min N] [--max N] [--rpm M]
  *   pi-swarm status --run <runId>
  *   pi-swarm stop --run <runId>
  *   pi-swarm dashboard --run <runId> [--port 3010] [--runtime-db postgres://...]
@@ -79,7 +79,7 @@ if (!subcmd || subcmd === '--help' || subcmd === '-h' || subcmd === 'help') {
   console.log(`Usage:
   pi-swarm run <job.mjs> [--concurrency 3000] [--workers 30] [--dashboard 3010] [--runtime-db <url>] [--only-tasks t1,t2] [--keep-alive]
   pi-swarm steer (--run <runId> | --job <job.mjs>) [--interrupt] [--tasks t1,t2] "<instruction>"
-  pi-swarm limit (--run <runId> | --job <job.mjs>) --pool <gate|curl|jina> [--limit N] [--min N] [--max N] [--rpm M]
+  pi-swarm limit (--run <runId> | --job <job.mjs>) --pool <gate|poolName> [--limit N] [--min N] [--max N] [--rpm M]
   pi-swarm status (--run <runId> | --job <job.mjs>)
   pi-swarm stop (--run <runId> | --job <job.mjs>)
   pi-swarm dashboard --run <runId> [--port 3010] [--host 127.0.0.1] [--runtime-db <url>]`);
@@ -123,7 +123,7 @@ if (subcmd === 'run') {
   });
   console.log(JSON.stringify(res, null, 2));
 } else if (subcmd === 'limit') {
-  if (!flags.pool) throw new Error('Missing --pool <gate|curl|jina>');
+  if (!flags.pool) throw new Error('Missing --pool <gate|poolName>');
   const sock = await resolveSocket(flags);
   const res = await sendControl(sock, {
     action: 'set_limit',

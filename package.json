@@ -13,8 +13,7 @@
   "exports": {
     ".": "./src/index.mjs",
     "./gate": "./src/gate.mjs",
-    "./runtime-db": "./src/runtime-db.mjs",
-    "./builtin-tools": "./src/builtin-tools.mjs"
+    "./runtime-db": "./src/runtime-db.mjs"
   },
   "files": [
     "bin",

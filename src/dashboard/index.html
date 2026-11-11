@@ -146,6 +146,9 @@ function render({ live, timeline = [], custom = {} }) {
   const poolTiles = Object.entries(live.pools || {}).map(([name, p]) =>
     tile(`Pool: ${name}`, `${fmt(p.inflight)} / ${fmt(p.limit)}`, `Waiting ${fmt(p.waiting)}${p.perMinute ? ` · 60s ${fmt(p.lastMinute)}/${fmt(p.perMinute)}` : ''}`)
   );
+  const metricTiles = Object.entries(live.metrics || {}).map(([name, val]) =>
+    tile(`Metric: ${name}`, fmt(val), 'Job metric')
+  );
 
   $('swarmTiles').innerHTML = [
     tile('Active Sessions', fmt(t.active), `Resumed from PG: ${fmt(live.resumedSessions || 0)}`),
@@ -156,6 +159,7 @@ function render({ live, timeline = [], custom = {} }) {
     tile('Pi Retries / Cont.', `${fmt(live.pi?.retries)} / ${fmt(live.pi?.continuations)}`, 'In-session recovery'),
     tile('Queue Wait p50/p95', last.waitP50 != null ? `${(last.waitP50/1000).toFixed(1)} / ${(last.waitP95/1000).toFixed(1)}s` : '—', 'Gate grant wait'),
     ...poolTiles,
+    ...metricTiles,
   ].join('');
 
   bars(

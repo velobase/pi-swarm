@@ -118,9 +118,7 @@ export async function runSupervisor({
   let toolSuccess = 0;
   let toolErrors = 0;
   let resumedSessions = 0;
-  let jinaCalls = restored.jinaCalls || 0;
-  let jinaTokens = restored.jinaTokens || 0;
-  let jina429 = 0;
+  const metrics = { ...(restored.metrics || {}) };
   let latestSnapshot = null;
 
   function recordError(taskId, text) {
@@ -216,26 +214,23 @@ export async function runSupervisor({
       return;
     }
     if (m.type === 'slot_acquire') {
-      const sp = slotPools[m.pool];
-      if (sp) {
-        sp.acquire(
-          m.id,
-          w.index,
-          () => w.child.connected && w.child.send({ type: 'slot_grant', pool: m.pool, id: m.id })
-        );
-      } else if (w.child.connected) {
-        w.child.send({ type: 'slot_grant', pool: m.pool, id: m.id });
+      // Auto-create pool on demand if job called ctx.pool('name', fn) without pre-declaring it
+      if (!slotPools[m.pool]) {
+        slotPools[m.pool] = new SlotPool(120, 0);
       }
+      slotPools[m.pool].acquire(
+        m.id,
+        w.index,
+        () => w.child.connected && w.child.send({ type: 'slot_grant', pool: m.pool, id: m.id })
+      );
       return;
     }
     if (m.type === 'slot_release') {
       slotPools[m.pool]?.release(m.id);
       return;
     }
-    if (m.type === 'jina_usage') {
-      jinaCalls++;
-      jinaTokens += Number(m.tokens || 0);
-      if (m.status === 429) jina429++;
+    if (m.type === 'metric') {
+      metrics[m.name] = (metrics[m.name] || 0) + (Number(m.delta) || 0);
       return;
     }
     if (m.type === 'ready') {
@@ -437,10 +432,7 @@ export async function runSupervisor({
   function buildPoolsSnapshot() {
     const out = {};
     for (const [k, sp] of Object.entries(slotPools)) {
-      out[k] =
-        k === 'jina'
-          ? { ...sp.snapshot(), calls: jinaCalls, tokens: jinaTokens, r429: jina429 }
-          : sp.snapshot();
+      out[k] = sp.snapshot();
     }
     return out;
   }
@@ -465,6 +457,7 @@ export async function runSupervisor({
       },
       gate: gate.snapshot(false),
       pools: buildPoolsSnapshot(),
+      metrics: { ...metrics },
       pi: { retries: piRetries, continuations: piContinuations },
       counters: { toolSuccess, toolErrors },
       recentFailures,
@@ -477,8 +470,7 @@ export async function runSupervisor({
       .saveHeartbeat(job.runId, {
         gateLimit: gate.limit,
         pools: buildPoolsSnapshot(),
-        jinaCalls,
-        jinaTokens,
+        metrics,
         snapshot: latestSnapshot,
         timeline: withTimeline ? timeline : null,
         finishedAt,

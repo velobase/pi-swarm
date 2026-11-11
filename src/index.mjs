@@ -115,14 +115,10 @@ export function defineSwarm(config) {
       cooldownMinMs: 2000,
       cooldownJitterMs: 3000,
     },
-    pools: {
-      curl: { limit: 300, perMinute: 0 },
-      jina: { limit: 300, perMinute: 480 },
-    },
+    pools: {},
     ...config,
   };
 }
 
 export { Gate, SlotPool, createGcloudVertexAuth, createStaticAuth } from './gate.mjs';
 export { RuntimeDb } from './runtime-db.mjs';
-export { createBuiltinTools } from './builtin-tools.mjs';
